@@ -1,0 +1,10 @@
+streamlit
+yfinance
+pandas
+plotly
+feedparser
+google-generativeai
+requests
+deep-translator
+textblob
+lxml
