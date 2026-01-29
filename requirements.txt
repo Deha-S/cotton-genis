@@ -8,3 +8,4 @@ requests
 deep-translator
 textblob
 lxml
+tradingview-ta
