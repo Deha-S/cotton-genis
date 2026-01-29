@@ -10,13 +10,30 @@ import json
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from datetime import datetime, timedelta
+from tradingview_ta import TA_Handler, Interval, Exchange
 
-# --- 1. AYARLAR (YENİ MARKA) ---
+# --- 1. AYARLAR (COTTON GENI'S) ---
 st.set_page_config(page_title="Cotton Geni's", page_icon="☁️", layout="wide")
 
-# --- 2. TEK VE ANA VERİ MOTORU (TABLO + FİYAT) ---
+# --- 2. MOTOR A: ANLIK FİYAT (TRADINGVIEW) ---
+# Bu fonksiyon Investing.com ile aynı veriyi (ICEUS:CT1!) çeker.
+@st.cache_data(ttl=10)
+def get_live_price():
+    try:
+        cotton = TA_Handler(
+            symbol="CT1!",
+            screener="america",
+            exchange="ICEUS",
+            interval=Interval.INTERVAL_1_MINUTE
+        )
+        analysis = cotton.get_analysis()
+        return analysis.indicators["close"], analysis.indicators["close"] - analysis.indicators["open"]
+    except:
+        return 0.0, 0.0
+
+# --- 3. MOTOR B: TABLO (HİBRİT) ---
 @st.cache_data(ttl=60)
-def get_futures_table_hybrid():
+def get_futures_table():
     # PLAN A: TradingCharts Sitesini Kazı
     url = "https://futures.tradingcharts.com/futures/quotes/ct.html?cbase=ct"
     headers = {
@@ -38,6 +55,7 @@ def get_futures_table_hybrid():
                 final_df = raw_df.dropna(subset=['Last_Clean'])
                 final_df = final_df.rename(columns={'Last_Clean': 'Son', 'Chg_Clean': 'Değişim', 'Month': 'Vade', 'Vol': 'Hacim'})
                 
+                # Spot (Cash) ve Vadeli Ayrımı
                 cash_row = final_df[final_df['Vade'].astype(str).str.contains("Cash", case=False, na=False)]
                 futures_df = final_df[~final_df['Vade'].astype(str).str.contains("Cash", case=False, na=False)]
                 
@@ -46,9 +64,9 @@ def get_futures_table_hybrid():
                     return combined[['Vade', 'Son', 'Değişim', 'Hacim']].reset_index(drop=True), "TradingCharts (Spot)"
                 elif not futures_df.empty:
                     return futures_df[['Vade', 'Son', 'Değişim', 'Hacim']].reset_index(drop=True), "TradingCharts (Vadeli)"
-    except Exception as e: print(f"Plan A Hatası: {e}")
+    except: pass
 
-    # PLAN B: Yahoo Finance (Elle Oluşturma)
+    # PLAN B: Yahoo Finance (Yedek)
     month_map = {3: 'H', 5: 'K', 7: 'N', 12: 'Z'} 
     curr_date = datetime.now()
     rows = []
@@ -85,7 +103,7 @@ def get_market_history(period_str):
         return df.dropna()
     except: return pd.DataFrame()
 
-# --- 3. İNDİKATÖRLER ---
+# --- 4. İNDİKATÖRLER ---
 def calculate_indicators(df):
     delta = df['Pamuk'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -97,7 +115,7 @@ def calculate_indicators(df):
     df['Lower'] = df['SMA20'] - (df['Pamuk'].rolling(20).std() * 2)
     return df
 
-# --- 4. HABERLER ---
+# --- 5. HABERLER ---
 @st.cache_data(ttl=900)
 def get_intel_news():
     queries = ['"cotton futures"', '"USDA" cotton export sales', '"H&M" sales', "polyester fiber price"]
@@ -124,7 +142,7 @@ def get_intel_news():
     except: pass
     return pd.DataFrame(news_data)
 
-# --- 5. AI ANALİST ---
+# --- 6. AI ANALİST ---
 def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_summary, scenario):
     try:
         genai.configure(api_key=api_key)
@@ -138,7 +156,7 @@ def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_s
         RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary}
         TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"}
         SENARYO: {scenario}
-        GÖREV: Tablo verilerine dayanarak fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur.
+        GÖREV: Fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur.
         ÇIKTI FORMATI:
         ## 🧭 Stratejik Analiz
         * [Yorum...]
@@ -166,7 +184,7 @@ def parse_ai_chart_data(text):
     except: pass
     return pd.DataFrame()
 
-# --- ARAYÜZ (YENİ MARKA) ---
+# --- ARAYÜZ ---
 if "GEMINI_API_KEY" in st.secrets: api_key = st.secrets["GEMINI_API_KEY"]
 else: api_key = st.sidebar.text_input("API Anahtarı", type="password")
 
@@ -179,18 +197,17 @@ with st.sidebar:
     period = st.selectbox("Periyot", ["3 Ay", "6 Ay", "1 Yıl", "3 Yıl"], index=1)
 
 # VERİ HAZIRLIĞI
-table_data, table_source = get_futures_table_hybrid()
-if not table_data.empty:
-    front_price = float(table_data.iloc[0]['Son'])
-    front_change = float(table_data.iloc[0]['Değişim'])
-    front_name = str(table_data.iloc[0]['Vade'])
-else:
-    front_price, front_change, front_name = 0.0, 0.0, "Veri Yok"
+# 1. Anlık Fiyat (TradingView) - Asla Şaşmaz
+live_price, live_change = get_live_price()
 
+# 2. Tablo (Hibrit) - Asla Boş Kalmaz
+table_data, table_source = get_futures_table()
+
+# 3. Grafik Geçmişi
 df_hist = get_market_history(period)
 news_df = get_intel_news()
 
-if df_hist.empty: st.error("Veri bağlantısı kurulamadı."); st.stop()
+if df_hist.empty: st.error("Bağlantı hatası."); st.stop()
 else: df_hist = calculate_indicators(df_hist)
 
 usdcny = float(df_hist['USDCNY'].iloc[-1]) if 'USDCNY' in df_hist else 7.2
@@ -200,15 +217,28 @@ if 'cot_data' not in st.session_state: st.session_state['cot_data'] = {"cl": 150
 cot = st.session_state['cot_data']
 fix_ratio = (cot['cs'] / (cot['cl']+cot['cs']+cot['fl']+cot['fs'])) * 100
 cot_summary = f"Ticari Short: {cot['cs']}, Fon Long: {cot['fl']}, Fix: {fix_ratio:.1f}%"
-if front_price == 0: front_price = df_hist['Pamuk'].iloc[-1]; front_change = front_price - df_hist['Pamuk'].iloc[-2]; front_name = "Yedek Veri"
+
+# EĞER TradingView Bağlanamazsa, Tablodan al, o da yoksa grafikten al
+if live_price > 0:
+    display_price = live_price
+    display_change = live_change
+else:
+    # Yedek Fiyat
+    if not table_data.empty:
+        display_price = float(table_data.iloc[0]['Son'])
+        display_change = float(table_data.iloc[0]['Değişim'])
+    else:
+        display_price = df_hist['Pamuk'].iloc[-1]
+        display_change = 0.0
 
 # --- EKRANLAR ---
 if menu == "📊 Ana Ekran":
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"Pamuk ({front_name})", f"{front_price:.2f}c", f"{front_change:.2f}")
+    c1.metric("Pamuk (Canlı)", f"{display_price:.2f}c", f"{display_change:.2f}")
     c2.metric("Petrol", f"${df_hist['Petrol'].iloc[-1]:.2f}", f"{df_hist['Petrol'].iloc[-1]-df_hist['Petrol'].iloc[-2]:.2f}")
     c3.metric("Sentetik", f"{poly_cent:.2f}c", "Piyasa")
     c4.metric("DXY", f"{df_hist['DXY'].iloc[-1]:.2f}", f"{df_hist['DXY'].iloc[-1]-df_hist['DXY'].iloc[-2]:.2f}")
+    
     st.divider()
     st.subheader("📈 Fiyat Grafiği")
     fig = go.Figure()
@@ -216,6 +246,7 @@ if menu == "📊 Ana Ekran":
     fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#e74c3c', width=2, dash='dot'), yaxis='y2'))
     fig.update_layout(height=450, margin=dict(l=20,r=20,t=20,b=20), yaxis2=dict(overlaying='y', side='right', showgrid=False), legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig, use_container_width=True)
+    
     st.divider()
     col_l, col_r = st.columns([1, 1])
     with col_l:
@@ -242,7 +273,7 @@ elif menu == "🤖 AI Strateji":
     scen = st.text_area("Senaryo:", placeholder="Hedge oranını artırmalı mıyım?")
     if st.button("Analiz Et") and api_key:
         with st.spinner("AI Fiyat Grafiği Oluşturuyor..."):
-            report = ask_gemini_with_chart(api_key, front_price, news_df, table_data, poly_cent, cot_summary, scen)
+            report = ask_gemini_with_chart(api_key, display_price, news_df, table_data, poly_cent, cot_summary, scen)
             st.markdown(report.split("```json")[0])
             forecast_df = parse_ai_chart_data(report)
             if not forecast_df.empty:
