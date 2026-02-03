@@ -124,17 +124,11 @@ def get_historical_cot():
                 with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                     filename = z.namelist()[0]
                     with z.open(filename) as f:
-                        # Legacy Format Sütunları
-                        # Market_and_Exchange_Names (0), Report_Date_as_MM_DD_YYYY (2)
-                        # NonComm_Positions_Long_All (8), NonComm_Positions_Short_All (9)
-                        # Comm_Positions_Long_All (11), Comm_Positions_Short_All (12)
-                        
                         df = pd.read_csv(f, low_memory=False)
                         # Pamuk Filtresi
                         cotton_df = df[df['Market_and_Exchange_Names'].astype(str).str.contains("COTTON NO. 2", case=False, na=False)].copy()
                         
                         if not cotton_df.empty:
-                            # Gerekli Sütunları Seç ve Yeniden Adlandır
                             cols = {
                                 'Report_Date_as_MM_DD_YYYY': 'Date',
                                 'NonComm_Positions_Long_All': 'Fon_Long',
@@ -142,12 +136,9 @@ def get_historical_cot():
                                 'Comm_Positions_Long_All': 'Ticari_Long',
                                 'Comm_Positions_Short_All': 'Ticari_Short'
                             }
-                            # Sütun isimleri bazen değişebilir, index ile garantiye alalım (Legacy Format Standarttır)
-                            # Ancak CFTC header kullanıyor, isimle eşleştirmek daha güvenli.
-                            # Eğer isimler tutmazsa diye hata yönetimi:
                             try:
                                 cotton_df = cotton_df[list(cols.keys())].rename(columns=cols)
-                            exceptKeyError:
+                            except KeyError:
                                 # Fallback: Index tabanlı (Riskli ama gerekli olabilir)
                                 pass 
                             
