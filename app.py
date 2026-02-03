@@ -12,16 +12,12 @@ from textblob import TextBlob
 from datetime import datetime, timedelta
 from tradingview_ta import TA_Handler, Interval, Exchange
 
-# --- 1. AYARLAR & TASARIM (CSS ENJEKSİYONU) ---
+# --- 1. AYARLAR & TASARIM ---
 st.set_page_config(page_title="Cotton Geni's", page_icon="☁️", layout="wide")
 
-# Özel CSS ile "Sade ama Güçlü" Görünüm
 st.markdown("""
 <style>
-    /* Ana Arka Planı Hafif Gri Yapalım */
     .stApp {background-color: #FAFAFA;}
-    
-    /* Metric Kutularını "Kart" Gibi Yapalım */
     [data-testid="stMetric"] {
         background-color: #FFFFFF;
         border: 1px solid #E0E0E0;
@@ -30,19 +26,8 @@ st.markdown("""
         box-shadow: 0 2px 5px rgba(0,0,0,0.05);
         text-align: center;
     }
-    
-    /* Başlık Fontlarını Güçlendirelim */
-    h1, h2, h3 {
-        color: #0F172A;
-        font-family: 'Helvetica Neue', sans-serif;
-        font-weight: 700;
-    }
-    
-    /* Sidebar Düzeni */
-    section[data-testid="stSidebar"] {
-        background-color: #F8F9FA;
-        border-right: 1px solid #E5E7EB;
-    }
+    h1, h2, h3 {color: #0F172A; font-family: 'Helvetica Neue', sans-serif; font-weight: 700;}
+    section[data-testid="stSidebar"] {background-color: #F8F9FA; border-right: 1px solid #E5E7EB;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -57,7 +42,6 @@ def get_live_price():
 
 @st.cache_data(ttl=60)
 def get_futures_table():
-    # PLAN A: TradingCharts
     url = "https://futures.tradingcharts.com/futures/quotes/ct.html?cbase=ct"
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
     try:
@@ -81,7 +65,6 @@ def get_futures_table():
                     return futures_df[['Vade', 'Son', 'Değişim', 'Hacim']].reset_index(drop=True), "Canlı Veri (Vadeli)"
     except: pass
     
-    # PLAN B: Yahoo
     month_map = {3: 'H', 5: 'K', 7: 'N', 12: 'Z'} 
     curr_date = datetime.now(); rows = []
     for i in range(24): 
@@ -138,14 +121,29 @@ def get_intel_news():
     except: pass
     return pd.DataFrame(news_data)
 
-def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_summary, scenario):
+# --- AI ANALİST (ÖNCELİK AYARLI) ---
+def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_summary, scenario, weights):
     try:
         genai.configure(api_key=api_key)
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         model = genai.GenerativeModel(next((m for m in models if 'flash' in m), models[0] if models else None))
         table_txt = table_df.to_string(index=False) if not table_df.empty else "Veri Yok"
-        prompt = f"""Sen Profesyonel Pamuk Tüccarısın. BUGÜN: {datetime.now().strftime("%Y-%m-%d")} | FİYAT: {spot_val:.2f}c | RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} | TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"} | SENARYO: {scenario}
-        GÖREV: Fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur.
+        
+        # Ağırlıkları Metne Dök
+        priority_instruction = "ANALİZ YAPARKEN ŞU AĞIRLIKLARA GÖRE KARAR VER (0=Önemsiz, 10=Çok Önemli):\n"
+        for k, v in weights.items():
+            priority_instruction += f"- {k}: {v}/10 Puan Önem Derecesi\n"
+        
+        prompt = f"""Sen Profesyonel Pamuk Tüccarısın. 
+        
+        {priority_instruction}
+        
+        BUGÜN: {datetime.now().strftime("%Y-%m-%d")} | FİYAT: {spot_val:.2f}c | RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} 
+        TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"} 
+        SENARYO: {scenario}
+        
+        GÖREV: Yukarıdaki öncelik puanlarını dikkate alarak fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur. Eğer bir verinin puanı 0 ise, o veriyi analizde tamamen görmezden gel.
+        
         ÇIKTI FORMATI: ## 🧭 Stratejik Analiz \n* [Yorum...] \n## 🦊 Pozisyonlar \n* [Yorum...]
         ```json
         {{ "forecast": [ {{"label": "Bugün", "date": "{datetime.now().strftime("%Y-%m-%d")}", "price": {spot_val}}}, {{"label": "Kısa Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Orta Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Uzun Vade", "date": "YYYY-MM-DD", "price": 00.00}} ] }}
@@ -160,7 +158,7 @@ def parse_ai_chart_data(text):
     except: pass
     return pd.DataFrame()
 
-# --- 3. ANA UYGULAMA (GİRİŞ KONTROLU) ---
+# --- 3. ANA UYGULAMA ---
 def check_login():
     if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
     if not st.session_state['logged_in']:
@@ -181,13 +179,40 @@ if check_login():
     if "GEMINI_API_KEY" in st.secrets: api_key = st.secrets["GEMINI_API_KEY"]
     else: api_key = st.sidebar.text_input("API Anahtarı", type="password")
 
+    # --- AĞIRLIK AYARLARI (SESSION STATE BAŞLANGIÇ) ---
+    if 'w_news' not in st.session_state: st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
+
+    # OTOMATİK AYAR FONKSİYONU
+    def set_auto_weights():
+        st.session_state['w_news'] = 9
+        st.session_state['w_cot'] = 7
+        st.session_state['w_tech'] = 5
+        st.session_state['w_poly'] = 8
+        st.session_state['w_basis'] = 6
+
     with st.sidebar:
         st.markdown("## ☁️ Menü")
         menu = st.radio("", ["📊 Ana Ekran", "🦊 Pozisyonlar (COT)", "🤖 AI Strateji", "📉 Teknik"], label_visibility="collapsed")
         st.divider()
-        with st.expander("⚙️ Ayarlar", expanded=True):
+        
+        with st.expander("⚙️ Veri & Grafik Ayarları"):
             poly_rmb = st.number_input("Polyester (RMB)", value=6587)
             period = st.selectbox("Grafik Süresi", ["3 Ay", "6 Ay", "1 Yıl", "3 Yıl"], index=1)
+        
+        # --- YENİ: YAPAY ZEKA AYARLARI ---
+        with st.expander("🧠 AI Karar Mekanizması", expanded=True):
+            st.caption("Yapay zekanın neye önem vereceğini seçin (0-10)")
+            
+            st.session_state['w_news'] = st.slider("Haberler & USDA", 0, 10, st.session_state['w_news'], key="sl_news")
+            st.session_state['w_poly'] = st.slider("Polyester Rekabeti", 0, 10, st.session_state['w_poly'], key="sl_poly")
+            st.session_state['w_cot'] = st.slider("COT (Fon Pozisyonları)", 0, 10, st.session_state['w_cot'], key="sl_cot")
+            st.session_state['w_basis'] = st.slider("Spot/Vadeli Farkı", 0, 10, st.session_state['w_basis'], key="sl_basis")
+            st.session_state['w_tech'] = st.slider("Teknik Analiz", 0, 10, st.session_state['w_tech'], key="sl_tech")
+            
+            if st.button("✨ Otomatik Önerilen", use_container_width=True):
+                set_auto_weights()
+                st.rerun()
+
         if st.button("Çıkış", type="secondary"):
             st.session_state['logged_in'] = False
             st.rerun()
@@ -216,61 +241,29 @@ if check_login():
 
     # --- EKRANLAR ---
     if menu == "📊 Ana Ekran":
-        # KART GÖRÜNÜMÜ (Metrics)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Pamuk (Canlı)", f"{display_price:.2f}c", f"{display_change:.2f}")
         c2.metric("Petrol", f"${df_hist['Petrol'].iloc[-1]:.2f}", f"{df_hist['Petrol'].iloc[-1]-df_hist['Petrol'].iloc[-2]:.2f}")
         c3.metric("Sentetik", f"{poly_cent:.2f}c", "Piyasa")
         c4.metric("DXY", f"{df_hist['DXY'].iloc[-1]:.2f}", f"{df_hist['DXY'].iloc[-1]-df_hist['DXY'].iloc[-2]:.2f}")
         
-        st.markdown("<br>", unsafe_allow_html=True) # Boşluk
-
-        # PROFESYONEL GRAFİK
+        st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📈 Fiyat Grafiği")
         fig = go.Figure()
-        # Pamuk Çizgisi (Güçlü Mavi)
-        fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Pamuk', 
-                                 line=dict(color='#1E3A8A', width=3)))
-        # Petrol Çizgisi (Mat Kırmızı)
-        fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', 
-                                 line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
-        
-        fig.update_layout(
-            height=500, 
-            template="plotly_white", # Temiz arka plan
-            margin=dict(l=20,r=20,t=40,b=20),
-            yaxis2=dict(overlaying='y', side='right', showgrid=False),
-            legend=dict(orientation="h", y=1.1, x=0),
-            hovermode="x unified" # Profesyonel tooltip
-        )
+        fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Pamuk', line=dict(color='#1E3A8A', width=3)))
+        fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
+        fig.update_layout(height=500, template="plotly_white", margin=dict(l=20,r=20,t=40,b=20), yaxis2=dict(overlaying='y', side='right', showgrid=False), legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         
         st.divider()
-        
         col_l, col_r = st.columns([1, 1])
         with col_l:
             st.subheader(f"📋 Derinlik ({table_source})")
-            if not table_data.empty:
-                st.dataframe(table_data, 
-                             column_config={
-                                 "Vade": st.column_config.TextColumn("Kontrat", width="small"),
-                                 "Son": st.column_config.NumberColumn("Son Fiyat", format="%.2f"),
-                                 "Değişim": st.column_config.NumberColumn("Değişim", format="%.2f"), # Renklendirme otomatik olur
-                                 "Hacim": st.column_config.ProgressColumn("Hacim", format="%d", min_value=0, max_value=int(table_data['Hacim'].max()))
-                             }, 
-                             hide_index=True, use_container_width=True)
+            if not table_data.empty: st.dataframe(table_data, column_config={"Vade": st.column_config.TextColumn("Kontrat", width="small"), "Son": st.column_config.NumberColumn("Son Fiyat", format="%.2f"), "Değişim": st.column_config.NumberColumn("Değişim", format="%.2f"), "Hacim": st.column_config.ProgressColumn("Hacim", format="%d", min_value=0, max_value=int(table_data['Hacim'].max()))}, hide_index=True, use_container_width=True)
             else: st.warning("Veri bekleniyor...")
-            
         with col_r:
             st.subheader("📡 İstihbarat")
-            if not news_df.empty: 
-                st.dataframe(news_df[['Duygu', 'Başlık', 'Link']], 
-                             column_config={
-                                 "Link": st.column_config.LinkColumn("Oku", display_text="🔗"),
-                                 "Duygu": st.column_config.TextColumn("Yön", width="small"),
-                                 "Başlık": st.column_config.TextColumn("Haber Başlığı", width="medium")
-                             }, 
-                             hide_index=True, use_container_width=True)
+            if not news_df.empty: st.dataframe(news_df[['Duygu', 'Başlık', 'Link']], column_config={"Link": st.column_config.LinkColumn("Oku", display_text="🔗"), "Duygu": st.column_config.TextColumn("Yön", width="small"), "Başlık": st.column_config.TextColumn("Haber Başlığı", width="medium")}, hide_index=True, use_container_width=True)
 
     elif menu == "🦊 Pozisyonlar (COT)":
         st.subheader("Piyasa Oyuncu Dağılımı")
@@ -283,64 +276,54 @@ if check_login():
             new_fs = st.number_input("Fon Short", value=cot['fs'])
             st.session_state['cot_data'] = {"cl": new_cl, "cs": new_cs, "fl": new_fl, "fs": new_fs}
         with c2:
-            fig_pie = go.Figure(data=[go.Pie(labels=['Fix (Short)', 'Tic. Long', 'Fon Long', 'Fon Short'], 
-                                             values=[new_cs, new_cl, new_fl, new_fs], hole=.5)])
+            fig_pie = go.Figure(data=[go.Pie(labels=['Fix (Short)', 'Tic. Long', 'Fon Long', 'Fon Short'], values=[new_cs, new_cl, new_fl, new_fs], hole=.5)])
             fig_pie.update_layout(template="plotly_white")
             st.plotly_chart(fig_pie, use_container_width=True)
 
     elif menu == "🤖 AI Strateji":
         st.subheader("Yapay Zeka Analisti")
+        
+        # Ağırlıkları Hazırla
+        current_weights = {
+            "Haberler ve Temel Analiz": st.session_state['w_news'],
+            "Polyester ve Sentetik Rekabeti": st.session_state['w_poly'],
+            "COT (Fon/Ticari Pozisyonlar)": st.session_state['w_cot'],
+            "Basis (Spot vs Vadeli Farkı)": st.session_state['w_basis'],
+            "Teknik Analiz (Grafik)": st.session_state['w_tech']
+        }
+        
+        # Kullanıcıya Seçimlerini Göster (Bilgi Amaçlı)
+        st.info(f"💡 AI şu anki analizinde **Haberlere {current_weights['Haberler ve Temel Analiz']}/10**, **Tekniğe {current_weights['Teknik Analiz (Grafik)']}/10** önem verecek.")
+        
         scen = st.text_area("Senaryo / Soru:", placeholder="Örn: Faiz kararı sonrası pamuk ne olur?")
         if st.button("Analizi Başlat", type="primary") and api_key:
             with st.spinner("AI piyasayı tarıyor ve grafik çiziyor..."):
-                report = ask_gemini_with_chart(api_key, display_price, news_df, table_data, poly_cent, cot_summary, scen)
+                report = ask_gemini_with_chart(api_key, display_price, news_df, table_data, poly_cent, cot_summary, scen, current_weights)
                 st.markdown(report.split("```json")[0])
                 forecast_df = parse_ai_chart_data(report)
                 if not forecast_df.empty:
-                    st.divider()
-                    st.subheader("🤖 AI Gelecek Projeksiyonu")
+                    st.divider(); st.subheader("🤖 AI Gelecek Projeksiyonu")
                     fig_ai = go.Figure()
                     short_hist = df_hist.tail(45)
-                    # Gerçekleşen
-                    fig_ai.add_trace(go.Scatter(x=short_hist.index, y=short_hist['Pamuk'], name='Gerçekleşen', 
-                                                line=dict(color='black', width=2)))
-                    # Tahmin
-                    fig_ai.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['price'], name='AI Tahmini', 
-                                                mode='lines+markers+text', text=forecast_df['price'], 
-                                                line=dict(color='#10B981', width=3, dash='dot'))) # Yeşil Kesik Çizgi
+                    fig_ai.add_trace(go.Scatter(x=short_hist.index, y=short_hist['Pamuk'], name='Gerçekleşen', line=dict(color='black', width=2)))
+                    fig_ai.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['price'], name='AI Tahmini', mode='lines+markers+text', text=forecast_df['price'], line=dict(color='#10B981', width=3, dash='dot')))
                     fig_ai.update_layout(template="plotly_white", height=450)
                     st.plotly_chart(fig_ai, use_container_width=True)
 
     elif menu == "📉 Teknik":
         st.subheader("Teknik Göstergeler")
         col_opt1, col_opt2, col_opt3 = st.columns(3)
-        show_fib = col_opt1.checkbox("Fibonacci", value=True)
-        show_bb = col_opt2.checkbox("Bollinger Bantları", value=True)
-        show_rsi = col_opt3.checkbox("RSI", value=True)
-        
+        show_fib = col_opt1.checkbox("Fibonacci", value=True); show_bb = col_opt2.checkbox("Bollinger Bantları", value=True); show_rsi = col_opt3.checkbox("RSI", value=True)
         fig_tech = go.Figure()
         if show_bb:
-            fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Upper'], name='BB Üst', 
-                                          line=dict(color='gray', width=1, dash='dot')))
-            fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Lower'], name='BB Alt', 
-                                          line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(200,200,200,0.1)'))
-        
-        fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Fiyat', 
-                                      line=dict(color='black', width=2)))
-        
+            fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Upper'], name='BB Üst', line=dict(color='gray', width=1, dash='dot')))
+            fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Lower'], name='BB Alt', line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(200,200,200,0.1)'))
+        fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Fiyat', line=dict(color='black', width=2)))
         if show_fib:
-            max_p, min_p = df_hist['Pamuk'].max(), df_hist['Pamuk'].min()
-            diff = max_p - min_p
-            for r, c in [(0.0, "red"), (0.5, "blue"), (1.0, "black")]: 
-                fig_tech.add_hline(y=max_p - r * diff, line_dash="dash", line_color=c, annotation_text=f"Fib {r}")
-                
-        fig_tech.update_layout(template="plotly_white", height=500)
-        st.plotly_chart(fig_tech, use_container_width=True)
-        
+            max_p, min_p = df_hist['Pamuk'].max(), df_hist['Pamuk'].min(); diff = max_p - min_p
+            for r, c in [(0.0, "red"), (0.5, "blue"), (1.0, "black")]: fig_tech.add_hline(y=max_p - r * diff, line_dash="dash", line_color=c, annotation_text=f"Fib {r}")
+        fig_tech.update_layout(template="plotly_white", height=500); st.plotly_chart(fig_tech, use_container_width=True)
         if show_rsi:
-            fig_rsi = go.Figure()
-            fig_rsi.add_trace(go.Scatter(x=df_hist.index, y=df_hist['RSI'], name='RSI', line=dict(color='#8B5CF6')))
-            fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
-            fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
-            fig_rsi.update_layout(height=200, template="plotly_white", title="RSI Momentum", margin=dict(t=30,b=10))
-            st.plotly_chart(fig_rsi, use_container_width=True)
+            fig_rsi = go.Figure(); fig_rsi.add_trace(go.Scatter(x=df_hist.index, y=df_hist['RSI'], name='RSI', line=dict(color='#8B5CF6')))
+            fig_rsi.add_hline(y=70, line_dash="dash", line_color="red"); fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+            fig_rsi.update_layout(height=200, template="plotly_white", title="RSI Momentum", margin=dict(t=30,b=10)); st.plotly_chart(fig_rsi, use_container_width=True)
