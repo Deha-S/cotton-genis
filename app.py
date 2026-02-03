@@ -9,10 +9,12 @@ import json
 import io
 import zipfile
 import os
+import glob
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from datetime import datetime, timedelta
 from tradingview_ta import TA_Handler, Interval, Exchange
+import time
 
 # --- 1. AYARLAR & TASARIM ---
 st.set_page_config(page_title="Cotton Geni's", page_icon="☁️", layout="wide")
@@ -78,6 +80,7 @@ def get_futures_table():
             sym = f"CT{month_map[m]}{str(y)[-2:]}.NYB"; name = f"{future_date.strftime('%b')}'{str(y)[-2:]}"
             if y > curr_date.year or (y == curr_date.year and m >= curr_date.month):
                 try:
+                    import yfinance as yf
                     t = yf.Ticker(sym); hist = t.history(period="5d")
                     if not hist.empty: rows.append({"Vade": name, "Son": float(hist['Close'].iloc[-1]), "Değişim": float(hist['Close'].iloc[-1] - (hist['Close'].iloc[-2] if len(hist)>1 else hist['Close'].iloc[-1])), "Hacim": int(hist['Volume'].iloc[-1])})
                 except: continue
@@ -86,19 +89,29 @@ def get_futures_table():
 
 @st.cache_data(ttl=60)
 def get_market_history(period_str):
+    import yfinance as yf
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
-    try:
-        data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False)
-        df = pd.DataFrame()
-        if 'CT=F' in data: df['Pamuk'] = data['CT=F']['Close']
-        if 'BZ=F' in data: df['Petrol'] = data['BZ=F']['Close']
-        if 'DX-Y.NYB' in data: df['DXY'] = data['DX-Y.NYB']['Close']
-        if 'CNY=X' in data: df['USDCNY'] = data['CNY=X']['Close']
-        return df.dropna()
-    except: return pd.DataFrame()
+    
+    # Israrcı Mod: Hata verirse 3 kez dene
+    for attempt in range(3):
+        try:
+            data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
+            df = pd.DataFrame()
+            if not data.empty:
+                if 'CT=F' in data: df['Pamuk'] = data['CT=F']['Close']
+                if 'BZ=F' in data: df['Petrol'] = data['BZ=F']['Close']
+                if 'DX-Y.NYB' in data: df['DXY'] = data['DX-Y.NYB']['Close']
+                if 'CNY=X' in data: df['USDCNY'] = data['CNY=X']['Close']
+                result = df.dropna()
+                if not result.empty: return result
+        except:
+            time.sleep(1) # Hata olursa 1 saniye bekle tekrar dene
+            
+    return pd.DataFrame()
 
 @st.cache_data(ttl=600)
 def get_comparison_data(ticker, period_str):
+    import yfinance as yf
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
     try:
         data = yf.download(ticker, period=mapping[period_str], progress=False)
@@ -109,18 +122,14 @@ def get_comparison_data(ticker, period_str):
         return pd.Series()
     except: return pd.Series()
 
-# --- GELİŞMİŞ COT ANALİZİ (VERİTABANI ODAKLI) ---
+# --- GELİŞMİŞ COT ANALİZİ (AKILLI DOSYA BULUCU) ---
 def parse_cftc_file(file_obj):
     """CFTC Dosyasını (CSV/TXT) Okur ve Temizler"""
     try:
-        # Header yok varsayarak oku
         df = pd.read_csv(file_obj, header=None, low_memory=False)
-        
-        # Pamuk Filtresi (Market Name sütunu genelde 0. indekstir)
         cotton_df = df[df[0].astype(str).str.contains("COTTON NO. 2", case=False, na=False)].copy()
         
         if not cotton_df.empty:
-            # Sütun Eşleştirme (Legacy Format Standartı)
             clean_df = pd.DataFrame()
             clean_df['Date'] = pd.to_datetime(cotton_df[2])
             clean_df['Fon_Long'] = pd.to_numeric(cotton_df[8], errors='coerce')
@@ -133,7 +142,7 @@ def parse_cftc_file(file_obj):
             clean_df['Net_Ticari'] = clean_df['Ticari_Long'] - clean_df['Ticari_Short']
             return clean_df
     except Exception as e:
-        st.error(f"Dosya okuma hatası: {str(e)}")
+        pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -141,20 +150,26 @@ def get_cot_data(uploaded_file=None):
     source_msg = ""
     df = pd.DataFrame()
 
-    # 1. YÖNTEM: KULLANICI ANLIK YÜKLEDİ Mİ? (En Yüksek Öncelik)
+    # 1. YÖNTEM: KULLANICI ANLIK YÜKLEDİ Mİ?
     if uploaded_file is not None:
         df = parse_cftc_file(uploaded_file)
         if not df.empty: return df, "✅ Anlık Yüklenen Dosya"
 
-    # 2. YÖNTEM: GITHUB/YEREL DATABASE DOSYASI VAR MI? (Orta Öncelik)
-    # Dosya adı: cot_history.csv (GitHub'a bunu yüklemeniz lazım)
-    if os.path.exists("cot_history.csv"):
-        with open("cot_history.csv", "r") as f:
-            df = parse_cftc_file(f)
-            if not df.empty: return df, "✅ Sistem Veritabanı (GitHub)"
-            
-    # 3. YÖNTEM: WEB'DEN ÇEKMEYİ DENE (Düşük Öncelik - Yedek)
-    # Bot koruması olduğu için burası genelde başarısız olabilir
+    # 2. YÖNTEM: GITHUB/YEREL DOSYALARI BUL (Otomatik Birleştirme)
+    # cot_history_*.csv formatındaki tüm dosyaları bul (2025, 2026 vs.)
+    local_files = glob.glob("cot_history*.csv")
+    if local_files:
+        combined_dfs = []
+        for f_path in local_files:
+            with open(f_path, "r") as f:
+                parsed = parse_cftc_file(f)
+                if not parsed.empty: combined_dfs.append(parsed)
+        
+        if combined_dfs:
+            full_df = pd.concat(combined_dfs).drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
+            return full_df, f"✅ Sistem Veritabanı ({len(local_files)} Dosya)"
+
+    # 3. YÖNTEM: WEB'DEN ÇEKMEYİ DENE (Yedek)
     try:
         url = "https://www.cftc.gov/dea/newcot/ice_lf.txt"
         r = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
@@ -167,7 +182,6 @@ def get_cot_data(uploaded_file=None):
 
 def calculate_cot_trends(df):
     if df.empty: return None
-    
     last_row = df.iloc[-1]
     
     if len(df) >= 2:
@@ -295,7 +309,7 @@ if check_login():
     df_hist = get_market_history(period)
     news_df = get_intel_news()
 
-    if df_hist.empty: st.error("Fiyat verisi hatası. Lütfen sayfayı yenileyin."); st.stop()
+    if df_hist.empty: st.error("Fiyat verisi hatası. Lütfen sayfayı yenileyin (İnternet veya Yahoo Finance geçici olarak yanıt vermiyor olabilir)."); st.stop()
     else: df_hist = calculate_indicators(df_hist)
 
     usdcny = float(df_hist['USDCNY'].iloc[-1]) if 'USDCNY' in df_hist else 7.2
