@@ -16,10 +16,8 @@ from datetime import datetime, timedelta
 from tradingview_ta import TA_Handler, Interval, Exchange
 import time
 
-# --- 1. AYARLAR & TASARIM (LOGO ENTEGRASYONU) ---
-# Favicon Ayarı: Logo varsa onu kullan, yoksa bulut ikonu koy
+# --- 1. AYARLAR & TASARIM ---
 page_icon = "logo.png" if os.path.exists("logo.png") else "☁️"
-
 st.set_page_config(page_title="Cotton Geni's", page_icon=page_icon, layout="wide")
 
 st.markdown("""
@@ -238,12 +236,12 @@ def parse_ai_chart_data(text):
 def check_login():
     if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
     if not st.session_state['logged_in']:
-        # LOGO VARSA GİRİŞ EKRANINDA GÖSTER
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown("<br><br>", unsafe_allow_html=True)
             if os.path.exists("logo.png"):
-                st.image("logo.png", use_container_width=True)
+                # DÜZELTME: Logoya sabit genişlik (300px) verildi.
+                st.image("logo.png", width=300)
             else:
                 st.markdown("<h2 style='text-align: center;'>☁️ Cotton Geni's</h2>", unsafe_allow_html=True)
             
@@ -267,9 +265,10 @@ if check_login():
 
     # SIDEBAR
     with st.sidebar:
-        # --- LOGO ALANI ---
+        # --- LOGO ALANI (YAN MENÜ) ---
         if os.path.exists("logo.png"):
-            st.image("logo.png", use_container_width=True)
+            # DÜZELTME: Yan menüdeki logoya daha küçük sabit genişlik (200px) verildi.
+            st.image("logo.png", width=200)
         else:
             st.markdown("""
                 <div style="text-align: center;">
