@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import feedparser
@@ -9,6 +8,7 @@ import re
 import json
 import io
 import zipfile
+import os
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from datetime import datetime, timedelta
@@ -30,6 +30,8 @@ st.markdown("""
     }
     h1, h2, h3 {color: #0F172A; font-family: 'Helvetica Neue', sans-serif; font-weight: 700;}
     section[data-testid="stSidebar"] {background-color: #F8F9FA; border-right: 1px solid #E5E7EB;}
+    .success-box {padding: 10px; background-color: #D1FAE5; color: #065F46; border-radius: 5px; margin-bottom: 10px; font-size: 0.9em;}
+    .warning-box {padding: 10px; background-color: #FEF3C7; color: #92400E; border-radius: 5px; margin-bottom: 10px; font-size: 0.9em;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,107 +109,78 @@ def get_comparison_data(ticker, period_str):
         return pd.Series()
     except: return pd.Series()
 
-# --- GELİŞMİŞ COT ANALİZİ (FALLBACK SİSTEMLİ) ---
-def parse_cot_date(date_obj):
-    try: return pd.to_datetime(date_obj, format='%Y-%m-%d')
-    except: 
-        try: return pd.to_datetime(date_obj)
-        except: return datetime.now()
-
-@st.cache_data(ttl=3600*24)
-def get_historical_cot():
-    # 1. YÖNTEM: TARİHSEL ZIP İNDİR (2025-2026)
-    current_year = datetime.now().year
-    years_to_try = [current_year, current_year - 1]
-    dfs = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    
-    for year in years_to_try:
-        url = f"https://www.cftc.gov/files/dea/history/deahistlf{year}.zip"
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                    filename = z.namelist()[0]
-                    with z.open(filename) as f:
-                        # Header olmadan oku, garanti olsun
-                        df = pd.read_csv(f, header=None, low_memory=False)
-                        
-                        # 0. Sütun Market Adı, Pamuğu Bul
-                        cotton_df = df[df[0].astype(str).str.contains("COTTON NO. 2", case=False, na=False)].copy()
-                        
-                        if not cotton_df.empty:
-                            # Sütunları Endeks ile Seç (Legacy Format Garantisi)
-                            # 2: Tarih, 8: NonComm Long, 9: NonComm Short, 11: Comm Long, 12: Comm Short
-                            clean_df = pd.DataFrame()
-                            clean_df['Date'] = cotton_df[2]
-                            clean_df['Fon_Long'] = pd.to_numeric(cotton_df[8], errors='coerce')
-                            clean_df['Fon_Short'] = pd.to_numeric(cotton_df[9], errors='coerce')
-                            clean_df['Ticari_Long'] = pd.to_numeric(cotton_df[11], errors='coerce')
-                            clean_df['Ticari_Short'] = pd.to_numeric(cotton_df[12], errors='coerce')
-                            
-                            dfs.append(clean_df)
-        except: pass
-    
-    if dfs:
-        try:
-            full_df = pd.concat(dfs)
-            full_df['Date'] = pd.to_datetime(full_df['Date'])
-            full_df = full_df.sort_values('Date').reset_index(drop=True)
-            full_df['Net_Fon'] = full_df['Fon_Long'] - full_df['Fon_Short']
-            full_df['Net_Ticari'] = full_df['Ticari_Long'] - full_df['Ticari_Short']
-            return full_df
-        except: pass
-
-    # 2. YÖNTEM (YEDEK): EĞER ZIP ÇALIŞMAZSA GÜNCEL TEK DOSYAYI ÇEK
-    # Bu en azından son haftayı kurtarır, ekran boş kalmaz.
-    fallback_url = "https://www.cftc.gov/dea/newcot/ice_lf.txt"
+# --- GELİŞMİŞ COT ANALİZİ (VERİTABANI ODAKLI) ---
+def parse_cftc_file(file_obj):
+    """CFTC Dosyasını (CSV/TXT) Okur ve Temizler"""
     try:
-        r = requests.get(fallback_url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            df = pd.read_csv(io.StringIO(r.text), header=None, low_memory=False)
-            row = df[df[0].str.contains("COTTON NO. 2", na=False, case=False)].iloc[0]
+        # Header yok varsayarak oku
+        df = pd.read_csv(file_obj, header=None, low_memory=False)
+        
+        # Pamuk Filtresi (Market Name sütunu genelde 0. indekstir)
+        cotton_df = df[df[0].astype(str).str.contains("COTTON NO. 2", case=False, na=False)].copy()
+        
+        if not cotton_df.empty:
+            # Sütun Eşleştirme (Legacy Format Standartı)
+            clean_df = pd.DataFrame()
+            clean_df['Date'] = pd.to_datetime(cotton_df[2])
+            clean_df['Fon_Long'] = pd.to_numeric(cotton_df[8], errors='coerce')
+            clean_df['Fon_Short'] = pd.to_numeric(cotton_df[9], errors='coerce')
+            clean_df['Ticari_Long'] = pd.to_numeric(cotton_df[11], errors='coerce')
+            clean_df['Ticari_Short'] = pd.to_numeric(cotton_df[12], errors='coerce')
             
-            # Tek satırlık DataFrame oluştur
-            fallback_data = {
-                'Date': [pd.to_datetime(row[1])],
-                'Net_Fon': [int(row[8]) - int(row[9])],
-                'Net_Ticari': [int(row[11]) - int(row[12])],
-                'Fon_Long': [int(row[8])], 'Fon_Short': [int(row[9])],
-                'Ticari_Long': [int(row[11])], 'Ticari_Short': [int(row[12])]
-            }
-            return pd.DataFrame(fallback_data)
+            clean_df = clean_df.sort_values('Date').reset_index(drop=True)
+            clean_df['Net_Fon'] = clean_df['Fon_Long'] - clean_df['Fon_Short']
+            clean_df['Net_Ticari'] = clean_df['Ticari_Long'] - clean_df['Ticari_Short']
+            return clean_df
+    except Exception as e:
+        st.error(f"Dosya okuma hatası: {str(e)}")
+    return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def get_cot_data(uploaded_file=None):
+    source_msg = ""
+    df = pd.DataFrame()
+
+    # 1. YÖNTEM: KULLANICI ANLIK YÜKLEDİ Mİ? (En Yüksek Öncelik)
+    if uploaded_file is not None:
+        df = parse_cftc_file(uploaded_file)
+        if not df.empty: return df, "✅ Anlık Yüklenen Dosya"
+
+    # 2. YÖNTEM: GITHUB/YEREL DATABASE DOSYASI VAR MI? (Orta Öncelik)
+    # Dosya adı: cot_history.csv (GitHub'a bunu yüklemeniz lazım)
+    if os.path.exists("cot_history.csv"):
+        with open("cot_history.csv", "r") as f:
+            df = parse_cftc_file(f)
+            if not df.empty: return df, "✅ Sistem Veritabanı (GitHub)"
+            
+    # 3. YÖNTEM: WEB'DEN ÇEKMEYİ DENE (Düşük Öncelik - Yedek)
+    # Bot koruması olduğu için burası genelde başarısız olabilir
+    try:
+        url = "https://www.cftc.gov/dea/newcot/ice_lf.txt"
+        r = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            df = parse_cftc_file(io.StringIO(r.text))
+            if not df.empty: return df, "⚠️ Yedek Sunucu (Sadece Güncel)"
     except: pass
     
-    return pd.DataFrame() # Her şey başarısız olursa boş dön
+    return pd.DataFrame(), "❌ Veri Bulunamadı"
 
 def calculate_cot_trends(df):
     if df.empty: return None
     
     last_row = df.iloc[-1]
     
-    # Yeterli veri varsa trend hesapla, yoksa (tek satırsa) Nötr de.
     if len(df) >= 2:
         prev_row = df.iloc[-2]
         fund_chg_w = last_row['Net_Fon'] - prev_row['Net_Fon']
-        # 5 satır yoksa ilk satırla kıyasla
         month_ago = df.iloc[-5] if len(df) >= 5 else df.iloc[0]
         fund_trend = "🟢 Artıyor" if (last_row['Net_Fon'] - month_ago['Net_Fon']) > 0 else "🔴 Azalıyor"
         comm_trend = "🟢 Artıyor" if (last_row['Net_Ticari'] - month_ago['Net_Ticari']) > 0 else "🔴 Azalıyor"
-        graph_df = df.tail(26) # Grafik için son 6 ay
+        graph_df = df.tail(52) # Son 1 Yıl
     else:
-        fund_chg_w = 0
-        fund_trend = "⚪ Veri Yetersiz"
-        comm_trend = "⚪ Veri Yetersiz"
-        graph_df = df # Sadece nokta gösterir
+        fund_chg_w = 0; fund_trend = "Nötr"; comm_trend = "Nötr"; graph_df = df
     
-    return {
-        "current": last_row,
-        "fund_chg_w": fund_chg_w,
-        "fund_trend": fund_trend,
-        "comm_trend": comm_trend,
-        "df_6mo": graph_df
-    }
+    return {"current": last_row, "fund_chg_w": fund_chg_w, "fund_trend": fund_trend, "comm_trend": comm_trend, "df_graph": graph_df}
 
 def calculate_indicators(df):
     delta = df['Pamuk'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -244,7 +217,6 @@ def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_s
         model = genai.GenerativeModel(next((m for m in models if 'flash' in m), models[0] if models else None))
         table_txt = table_df.to_string(index=False) if not table_df.empty else "Veri Yok"
         priority_instruction = "AĞIRLIKLAR (0-10):\n" + "\n".join([f"- {k}: {v}" for k,v in weights.items()])
-        
         prompt = f"""Sen Profesyonel Pamuk Tüccarısın. {priority_instruction}
         BUGÜN: {datetime.now().strftime("%Y-%m-%d")} | FİYAT: {spot_val:.2f}c | RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} 
         TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"} 
@@ -288,14 +260,17 @@ if check_login():
     if 'w_news' not in st.session_state: st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
     def set_auto_weights(): st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
 
-    # COT ANALİZİ BAŞLAT
-    cot_hist_df = get_historical_cot()
-    cot_analysis = calculate_cot_trends(cot_hist_df)
-
+    # SIDEBAR
     with st.sidebar:
         st.markdown("## ☁️ Menü")
         menu = st.radio("", ["📊 Ana Ekran", "⚖️ Karşılaştırma", "🦊 Pozisyonlar (COT)", "🤖 AI Strateji", "📉 Teknik"], label_visibility="collapsed")
         st.divider()
+        
+        # --- VERİ YÖNETİM PANELİ ---
+        with st.expander("💾 Veri Yönetimi (COT)", expanded=False):
+            st.info("Eğer otomatik veri gelmiyorsa, CFTC raporunu (Text) buradan yükleyebilirsiniz.")
+            uploaded_cot = st.file_uploader("CFTC Raporu Yükle", type=['txt', 'csv'])
+        
         with st.expander("⚙️ Veri & Grafik Ayarları"):
             poly_rmb = st.number_input("Polyester (RMB)", value=6587)
             period = st.selectbox("Grafik Süresi", ["3 Ay", "6 Ay", "1 Yıl", "3 Yıl"], index=1)
@@ -310,24 +285,28 @@ if check_login():
             if st.button("✨ Otomatik", use_container_width=True): set_auto_weights(); st.rerun()
         if st.button("Çıkış", type="secondary"): st.session_state['logged_in'] = False; st.rerun()
 
-    # VERİ
+    # --- VERİ HAZIRLIĞI ---
+    # COT Verisi (Hibrit Sistem)
+    cot_df, cot_source = get_cot_data(uploaded_cot)
+    cot_analysis = calculate_cot_trends(cot_df)
+
     live_price, live_change = get_live_price()
     table_data, table_source = get_futures_table()
     df_hist = get_market_history(period)
     news_df = get_intel_news()
 
-    if df_hist.empty: st.error("Veri hatası."); st.stop()
+    if df_hist.empty: st.error("Fiyat verisi hatası. Lütfen sayfayı yenileyin."); st.stop()
     else: df_hist = calculate_indicators(df_hist)
 
     usdcny = float(df_hist['USDCNY'].iloc[-1]) if 'USDCNY' in df_hist else 7.2
     poly_cent = (poly_rmb / usdcny / 2204.62) * 100
 
     # COT Özet Metni
-    if cot_analysis:
+    if cot_analysis and cot_analysis['current'] is not None:
         curr = cot_analysis['current']
         cot_summary = f"Tarih: {curr['Date'].strftime('%Y-%m-%d')} | Fon Net: {curr['Net_Fon']} ({cot_analysis['fund_trend']}), Ticari Net: {curr['Net_Ticari']} ({cot_analysis['comm_trend']})"
     else:
-        cot_summary = "COT Verisi Bekleniyor..."
+        cot_summary = "COT Verisi Yok"
 
     if live_price > 0: display_price = live_price; display_change = live_change
     else:
@@ -392,15 +371,15 @@ if check_login():
         else: st.warning("Seçilen varlık için veri çekilemedi.")
 
     elif menu == "🦊 Pozisyonlar (COT)":
-        if cot_analysis:
+        if cot_analysis and cot_analysis['current'] is not None:
             curr = cot_analysis['current']
             st.subheader(f"🦊 COT Analizi ({curr['Date'].strftime('%Y-%m-%d')})")
             
-            # Veri Kaynağı Bilgisi
-            if len(cot_analysis.get('df_6mo', [])) < 2:
-                st.info("ℹ️ CFTC Arşivine ulaşılamadı. Güncel Tek Rapor (Yedek) gösteriliyor.")
-            
-            # ÜST KARTLAR
+            # BİLGİ KUTUSU (KAYNAK)
+            if "GitHub" in cot_source: st.markdown(f'<div class="success-box">{cot_source} kullanılıyor.</div>', unsafe_allow_html=True)
+            elif "Anlık" in cot_source: st.markdown(f'<div class="success-box">{cot_source} (Geçici) kullanılıyor.</div>', unsafe_allow_html=True)
+            else: st.markdown(f'<div class="warning-box">{cot_source}</div>', unsafe_allow_html=True)
+
             k1, k2, k3, k4 = st.columns(4)
             fon_delta = cot_analysis['fund_chg_w']
             k1.metric("Fon Net (Long-Short)", f"{curr['Net_Fon']:,}", f"{fon_delta:,}", delta_color="normal")
@@ -410,10 +389,9 @@ if check_login():
             
             st.divider()
             
-            # 6 AYLIK TREND GRAFİĞİ
-            if len(cot_analysis['df_6mo']) > 1:
-                st.markdown("### 📊 Son 6 Ay: Fon vs. Ticari Savaşı")
-                df6 = cot_analysis['df_6mo']
+            if len(cot_analysis['df_graph']) > 1:
+                st.markdown("### 📊 Fon vs. Ticari Savaşı (Son 1 Yıl)")
+                df6 = cot_analysis['df_graph']
                 fig_cot = go.Figure()
                 fig_cot.add_trace(go.Scatter(x=df6['Date'], y=df6['Net_Fon'], name='Fon Net Pozisyonu', line=dict(color='#10B981', width=3), fill='tozeroy', fillcolor='rgba(16, 185, 129, 0.1)'))
                 fig_cot.add_trace(go.Scatter(x=df6['Date'], y=df6['Net_Ticari'], name='Ticari Net Pozisyonu', line=dict(color='#6B7280', width=2, dash='dot')))
@@ -421,12 +399,10 @@ if check_login():
                 fig_cot.update_layout(height=400, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.1))
                 st.plotly_chart(fig_cot, use_container_width=True)
             else:
-                st.warning("⚠️ Grafik için yeterli tarihsel veri indirilemedi, sadece güncel durum gösteriliyor.")
-            
-            st.caption("ℹ️ **Fon Pozisyonu (Yeşil):** Sıfırın üzerindeyse ve artıyorsa Fiyat Yükselebilir.\nℹ️ **Ticari Pozisyon (Gri):** Üreticilerin korunma amaçlı işlemleridir.")
+                st.warning("⚠️ Grafik için yeterli tarihsel veri yok.")
             
         else:
-            st.error("⚠️ Hem CFTC Arşivi hem de Yedek Sunucuya ulaşılamadı. Lütfen daha sonra tekrar deneyin.")
+            st.error("⚠️ Veri Bulunamadı. Lütfen sol menüden CFTC dosyasını yükleyin veya GitHub'a 'cot_history.csv' ekleyin.")
 
     elif menu == "🤖 AI Strateji":
         st.subheader("Yapay Zeka Analisti")
