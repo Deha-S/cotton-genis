@@ -93,6 +93,15 @@ def get_market_history(period_str):
         return df.dropna()
     except: return pd.DataFrame()
 
+# --- YENİ: KARŞILAŞTIRMA İÇİN VERİ ÇEKİCİ ---
+@st.cache_data(ttl=600)
+def get_comparison_data(ticker, period_str):
+    mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
+    try:
+        data = yf.download(ticker, period=mapping[period_str], progress=False)
+        return data['Close'] if not data.empty else pd.Series()
+    except: return pd.Series()
+
 def calculate_indicators(df):
     delta = df['Pamuk'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss; df['RSI'] = 100 - (100 / (1 + rs))
@@ -121,29 +130,19 @@ def get_intel_news():
     except: pass
     return pd.DataFrame(news_data)
 
-# --- AI ANALİST (ÖNCELİK AYARLI) ---
 def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_summary, scenario, weights):
     try:
         genai.configure(api_key=api_key)
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         model = genai.GenerativeModel(next((m for m in models if 'flash' in m), models[0] if models else None))
         table_txt = table_df.to_string(index=False) if not table_df.empty else "Veri Yok"
+        priority_instruction = "AĞIRLIKLAR (0-10):\n" + "\n".join([f"- {k}: {v}" for k,v in weights.items()])
         
-        # Ağırlıkları Metne Dök
-        priority_instruction = "ANALİZ YAPARKEN ŞU AĞIRLIKLARA GÖRE KARAR VER (0=Önemsiz, 10=Çok Önemli):\n"
-        for k, v in weights.items():
-            priority_instruction += f"- {k}: {v}/10 Puan Önem Derecesi\n"
-        
-        prompt = f"""Sen Profesyonel Pamuk Tüccarısın. 
-        
-        {priority_instruction}
-        
+        prompt = f"""Sen Profesyonel Pamuk Tüccarısın. {priority_instruction}
         BUGÜN: {datetime.now().strftime("%Y-%m-%d")} | FİYAT: {spot_val:.2f}c | RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} 
         TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"} 
         SENARYO: {scenario}
-        
-        GÖREV: Yukarıdaki öncelik puanlarını dikkate alarak fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur. Eğer bir verinin puanı 0 ise, o veriyi analizde tamamen görmezden gel.
-        
+        GÖREV: Fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur.
         ÇIKTI FORMATI: ## 🧭 Stratejik Analiz \n* [Yorum...] \n## 🦊 Pozisyonlar \n* [Yorum...]
         ```json
         {{ "forecast": [ {{"label": "Bugün", "date": "{datetime.now().strftime("%Y-%m-%d")}", "price": {spot_val}}}, {{"label": "Kısa Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Orta Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Uzun Vade", "date": "YYYY-MM-DD", "price": 00.00}} ] }}
@@ -179,43 +178,26 @@ if check_login():
     if "GEMINI_API_KEY" in st.secrets: api_key = st.secrets["GEMINI_API_KEY"]
     else: api_key = st.sidebar.text_input("API Anahtarı", type="password")
 
-    # --- AĞIRLIK AYARLARI (SESSION STATE BAŞLANGIÇ) ---
     if 'w_news' not in st.session_state: st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
-
-    # OTOMATİK AYAR FONKSİYONU
-    def set_auto_weights():
-        st.session_state['w_news'] = 9
-        st.session_state['w_cot'] = 7
-        st.session_state['w_tech'] = 5
-        st.session_state['w_poly'] = 8
-        st.session_state['w_basis'] = 6
+    def set_auto_weights(): st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
 
     with st.sidebar:
         st.markdown("## ☁️ Menü")
-        menu = st.radio("", ["📊 Ana Ekran", "🦊 Pozisyonlar (COT)", "🤖 AI Strateji", "📉 Teknik"], label_visibility="collapsed")
+        menu = st.radio("", ["📊 Ana Ekran", "⚖️ Karşılaştırma", "🦊 Pozisyonlar (COT)", "🤖 AI Strateji", "📉 Teknik"], label_visibility="collapsed")
         st.divider()
-        
         with st.expander("⚙️ Veri & Grafik Ayarları"):
             poly_rmb = st.number_input("Polyester (RMB)", value=6587)
             period = st.selectbox("Grafik Süresi", ["3 Ay", "6 Ay", "1 Yıl", "3 Yıl"], index=1)
         
-        # --- YENİ: YAPAY ZEKA AYARLARI ---
-        with st.expander("🧠 AI Karar Mekanizması", expanded=True):
-            st.caption("Yapay zekanın neye önem vereceğini seçin (0-10)")
-            
-            st.session_state['w_news'] = st.slider("Haberler & USDA", 0, 10, st.session_state['w_news'], key="sl_news")
-            st.session_state['w_poly'] = st.slider("Polyester Rekabeti", 0, 10, st.session_state['w_poly'], key="sl_poly")
-            st.session_state['w_cot'] = st.slider("COT (Fon Pozisyonları)", 0, 10, st.session_state['w_cot'], key="sl_cot")
-            st.session_state['w_basis'] = st.slider("Spot/Vadeli Farkı", 0, 10, st.session_state['w_basis'], key="sl_basis")
-            st.session_state['w_tech'] = st.slider("Teknik Analiz", 0, 10, st.session_state['w_tech'], key="sl_tech")
-            
-            if st.button("✨ Otomatik Önerilen", use_container_width=True):
-                set_auto_weights()
-                st.rerun()
-
-        if st.button("Çıkış", type="secondary"):
-            st.session_state['logged_in'] = False
-            st.rerun()
+        with st.expander("🧠 AI Karar Mekanizması", expanded=False):
+            st.caption("AI Analiz Ağırlıkları (0-10)")
+            st.session_state['w_news'] = st.slider("Haberler", 0, 10, st.session_state['w_news'])
+            st.session_state['w_poly'] = st.slider("Polyester", 0, 10, st.session_state['w_poly'])
+            st.session_state['w_cot'] = st.slider("COT", 0, 10, st.session_state['w_cot'])
+            st.session_state['w_basis'] = st.slider("Basis", 0, 10, st.session_state['w_basis'])
+            st.session_state['w_tech'] = st.slider("Teknik", 0, 10, st.session_state['w_tech'])
+            if st.button("✨ Otomatik", use_container_width=True): set_auto_weights(); st.rerun()
+        if st.button("Çıkış", type="secondary"): st.session_state['logged_in'] = False; st.rerun()
 
     # VERİ
     live_price, live_change = get_live_price()
@@ -246,7 +228,6 @@ if check_login():
         c2.metric("Petrol", f"${df_hist['Petrol'].iloc[-1]:.2f}", f"{df_hist['Petrol'].iloc[-1]-df_hist['Petrol'].iloc[-2]:.2f}")
         c3.metric("Sentetik", f"{poly_cent:.2f}c", "Piyasa")
         c4.metric("DXY", f"{df_hist['DXY'].iloc[-1]:.2f}", f"{df_hist['DXY'].iloc[-1]-df_hist['DXY'].iloc[-2]:.2f}")
-        
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📈 Fiyat Grafiği")
         fig = go.Figure()
@@ -254,7 +235,6 @@ if check_login():
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
         fig.update_layout(height=500, template="plotly_white", margin=dict(l=20,r=20,t=40,b=20), yaxis2=dict(overlaying='y', side='right', showgrid=False), legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
-        
         st.divider()
         col_l, col_r = st.columns([1, 1])
         with col_l:
@@ -264,6 +244,69 @@ if check_login():
         with col_r:
             st.subheader("📡 İstihbarat")
             if not news_df.empty: st.dataframe(news_df[['Duygu', 'Başlık', 'Link']], column_config={"Link": st.column_config.LinkColumn("Oku", display_text="🔗"), "Duygu": st.column_config.TextColumn("Yön", width="small"), "Başlık": st.column_config.TextColumn("Haber Başlığı", width="medium")}, hide_index=True, use_container_width=True)
+
+    elif menu == "⚖️ Karşılaştırma":
+        st.subheader("⚖️ Emtia & Varlık Karşılaştırma")
+        
+        # Varlık Havuzu
+        comp_assets = {
+            "Mısır (Corn)": "ZC=F",
+            "Soya (Soybean)": "ZS=F",
+            "Buğday (Wheat)": "ZW=F",
+            "Şeker (Sugar)": "SB=F",
+            "Kahve (Coffee)": "KC=F",
+            "Petrol (Brent)": "BZ=F",
+            "Altın (Gold)": "GC=F"
+        }
+        
+        col_sel1, col_sel2 = st.columns(2)
+        with col_sel1:
+            selected_asset_name = st.selectbox("Kıyaslanacak Varlık:", list(comp_assets.keys()))
+        with col_sel2:
+            view_mode = st.radio("Grafik Modu:", ["Yüzdesel Getiri (%)", "Fiyat (Dolar)"], horizontal=True)
+
+        selected_ticker = comp_assets[selected_asset_name]
+        
+        # Verileri Hazırla
+        cotton_series = df_hist['Pamuk']
+        target_series = get_comparison_data(selected_ticker, period)
+        
+        if not target_series.empty:
+            # Verileri aynı tarihlere eşitle
+            df_comp = pd.DataFrame({'Pamuk': cotton_series, 'Rakip': target_series}).dropna()
+            
+            # Korelasyon Hesapla
+            correlation = df_comp['Pamuk'].corr(df_comp['Rakip'])
+            
+            # Korelasyon Kartı
+            col_k1, col_k2 = st.columns([1, 3])
+            with col_k1:
+                color = "green" if correlation > 0.5 else "red" if correlation < -0.5 else "gray"
+                st.metric("Korelasyon Katsayısı", f"{correlation:.2f}", delta_color="off")
+                st.caption(f"1.00: Birebir aynı hareket\n0.00: İlgisiz\n-1.00: Ters hareket")
+            
+            with col_k2:
+                fig_comp = go.Figure()
+                
+                if view_mode == "Yüzdesel Getiri (%)":
+                    # Yüzdesel Normalize Et (Başlangıç = 0)
+                    norm_cotton = ((df_comp['Pamuk'] - df_comp['Pamuk'].iloc[0]) / df_comp['Pamuk'].iloc[0]) * 100
+                    norm_target = ((df_comp['Rakip'] - df_comp['Rakip'].iloc[0]) / df_comp['Rakip'].iloc[0]) * 100
+                    
+                    fig_comp.add_trace(go.Scatter(x=df_comp.index, y=norm_cotton, name='Pamuk (%)', line=dict(color='#1E3A8A', width=3)))
+                    fig_comp.add_trace(go.Scatter(x=df_comp.index, y=norm_target, name=f'{selected_asset_name.split()[0]} (%)', line=dict(color='#EA580C', width=2)))
+                    yaxis_title = "Getiri (%)"
+                else:
+                    # Fiyat Modu (Çift Eksen)
+                    fig_comp.add_trace(go.Scatter(x=df_comp.index, y=df_comp['Pamuk'], name='Pamuk (Cent)', line=dict(color='#1E3A8A', width=3)))
+                    fig_comp.add_trace(go.Scatter(x=df_comp.index, y=df_comp['Rakip'], name=f'{selected_asset_name.split()[0]}', line=dict(color='#EA580C', width=2, dash='dot'), yaxis='y2'))
+                    yaxis_title = "Pamuk Fiyatı"
+                    fig_comp.update_layout(yaxis2=dict(overlaying='y', side='right', showgrid=False, title=selected_asset_name))
+
+                fig_comp.update_layout(height=450, template="plotly_white", margin=dict(l=20,r=20,t=20,b=20), hovermode="x unified", yaxis_title=yaxis_title, legend=dict(orientation="h", y=1.1))
+                st.plotly_chart(fig_comp, use_container_width=True)
+        else:
+            st.warning("Seçilen varlık için veri çekilemedi.")
 
     elif menu == "🦊 Pozisyonlar (COT)":
         st.subheader("Piyasa Oyuncu Dağılımı")
@@ -282,22 +325,11 @@ if check_login():
 
     elif menu == "🤖 AI Strateji":
         st.subheader("Yapay Zeka Analisti")
-        
-        # Ağırlıkları Hazırla
-        current_weights = {
-            "Haberler ve Temel Analiz": st.session_state['w_news'],
-            "Polyester ve Sentetik Rekabeti": st.session_state['w_poly'],
-            "COT (Fon/Ticari Pozisyonlar)": st.session_state['w_cot'],
-            "Basis (Spot vs Vadeli Farkı)": st.session_state['w_basis'],
-            "Teknik Analiz (Grafik)": st.session_state['w_tech']
-        }
-        
-        # Kullanıcıya Seçimlerini Göster (Bilgi Amaçlı)
-        st.info(f"💡 AI şu anki analizinde **Haberlere {current_weights['Haberler ve Temel Analiz']}/10**, **Tekniğe {current_weights['Teknik Analiz (Grafik)']}/10** önem verecek.")
-        
+        current_weights = {"Haberler": st.session_state['w_news'], "Polyester": st.session_state['w_poly'], "COT": st.session_state['w_cot'], "Basis": st.session_state['w_basis'], "Teknik": st.session_state['w_tech']}
+        st.info(f"💡 AI Ağırlıkları: Haber={current_weights['Haberler']}, Teknik={current_weights['Teknik']}")
         scen = st.text_area("Senaryo / Soru:", placeholder="Örn: Faiz kararı sonrası pamuk ne olur?")
         if st.button("Analizi Başlat", type="primary") and api_key:
-            with st.spinner("AI piyasayı tarıyor ve grafik çiziyor..."):
+            with st.spinner("AI piyasayı tarıyor..."):
                 report = ask_gemini_with_chart(api_key, display_price, news_df, table_data, poly_cent, cot_summary, scen, current_weights)
                 st.markdown(report.split("```json")[0])
                 forecast_df = parse_ai_chart_data(report)
@@ -313,7 +345,7 @@ if check_login():
     elif menu == "📉 Teknik":
         st.subheader("Teknik Göstergeler")
         col_opt1, col_opt2, col_opt3 = st.columns(3)
-        show_fib = col_opt1.checkbox("Fibonacci", value=True); show_bb = col_opt2.checkbox("Bollinger Bantları", value=True); show_rsi = col_opt3.checkbox("RSI", value=True)
+        show_fib = col_opt1.checkbox("Fibonacci", value=True); show_bb = col_opt2.checkbox("Bollinger", value=True); show_rsi = col_opt3.checkbox("RSI", value=True)
         fig_tech = go.Figure()
         if show_bb:
             fig_tech.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Upper'], name='BB Üst', line=dict(color='gray', width=1, dash='dot')))
