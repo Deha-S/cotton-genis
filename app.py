@@ -10,6 +10,7 @@ import io
 import zipfile
 import os
 import glob
+import base64
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from datetime import datetime, timedelta
@@ -236,12 +237,18 @@ def parse_ai_chart_data(text):
 def check_login():
     if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
     if not st.session_state['logged_in']:
+        # LOGO VE ORTALAMA (CSS İLE GARANTİ)
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown("<br><br>", unsafe_allow_html=True)
             if os.path.exists("logo.png"):
-                # DÜZELTME: Logoya sabit genişlik (300px) verildi.
-                st.image("logo.png", width=300)
+                # Görüntüyü base64'e çevirip HTML ile ortalayarak basıyoruz (En sağlam yöntem)
+                with open("logo.png", "rb") as f:
+                    data = base64.b64encode(f.read()).decode("utf-8")
+                st.markdown(
+                    f'<div style="text-align: center;"><img src="data:image/png;base64,{data}" width="300"></div>',
+                    unsafe_allow_html=True,
+                )
             else:
                 st.markdown("<h2 style='text-align: center;'>☁️ Cotton Geni's</h2>", unsafe_allow_html=True)
             
@@ -267,7 +274,6 @@ if check_login():
     with st.sidebar:
         # --- LOGO ALANI (YAN MENÜ) ---
         if os.path.exists("logo.png"):
-            # DÜZELTME: Yan menüdeki logoya daha küçük sabit genişlik (200px) verildi.
             st.image("logo.png", width=200)
         else:
             st.markdown("""
