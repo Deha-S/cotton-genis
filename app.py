@@ -7,6 +7,8 @@ import google.generativeai as genai
 import requests
 import re
 import json
+import io
+import zipfile
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from datetime import datetime, timedelta
@@ -93,19 +95,95 @@ def get_market_history(period_str):
         return df.dropna()
     except: return pd.DataFrame()
 
-# --- DÜZELTİLEN FONKSİYON (SQUEEZE EKLENDİ) ---
 @st.cache_data(ttl=600)
 def get_comparison_data(ticker, period_str):
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
     try:
         data = yf.download(ticker, period=mapping[period_str], progress=False)
-        # HATA DÜZELTME: Gelen veriyi tek boyuta indir (squeeze) ve MultiIndex temizle
         if not data.empty:
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             return data['Close'].squeeze()
         return pd.Series()
     except: return pd.Series()
+
+# --- GELİŞMİŞ COT ANALİZİ (TARİHSEL VERİ) ---
+@st.cache_data(ttl=3600*24) # Günde 1 kere çekmesi yeterli
+def get_historical_cot():
+    # CFTC'den mevcut yılın tüm geçmişini ZIP olarak çek
+    current_year = datetime.now().year
+    years_to_try = [current_year, current_year - 1] # Yıl başındaysak geçen yılı da al
+    
+    dfs = []
+    
+    for year in years_to_try:
+        url = f"https://www.cftc.gov/files/dea/history/deahistlf{year}.zip"
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    filename = z.namelist()[0]
+                    with z.open(filename) as f:
+                        # Legacy Format Sütunları
+                        # Market_and_Exchange_Names (0), Report_Date_as_MM_DD_YYYY (2)
+                        # NonComm_Positions_Long_All (8), NonComm_Positions_Short_All (9)
+                        # Comm_Positions_Long_All (11), Comm_Positions_Short_All (12)
+                        
+                        df = pd.read_csv(f, low_memory=False)
+                        # Pamuk Filtresi
+                        cotton_df = df[df['Market_and_Exchange_Names'].astype(str).str.contains("COTTON NO. 2", case=False, na=False)].copy()
+                        
+                        if not cotton_df.empty:
+                            # Gerekli Sütunları Seç ve Yeniden Adlandır
+                            cols = {
+                                'Report_Date_as_MM_DD_YYYY': 'Date',
+                                'NonComm_Positions_Long_All': 'Fon_Long',
+                                'NonComm_Positions_Short_All': 'Fon_Short',
+                                'Comm_Positions_Long_All': 'Ticari_Long',
+                                'Comm_Positions_Short_All': 'Ticari_Short'
+                            }
+                            # Sütun isimleri bazen değişebilir, index ile garantiye alalım (Legacy Format Standarttır)
+                            # Ancak CFTC header kullanıyor, isimle eşleştirmek daha güvenli.
+                            # Eğer isimler tutmazsa diye hata yönetimi:
+                            try:
+                                cotton_df = cotton_df[list(cols.keys())].rename(columns=cols)
+                            exceptKeyError:
+                                # Fallback: Index tabanlı (Riskli ama gerekli olabilir)
+                                pass 
+                            
+                            cotton_df['Date'] = pd.to_datetime(cotton_df['Date'])
+                            dfs.append(cotton_df)
+        except: pass
+    
+    if dfs:
+        full_df = pd.concat(dfs).sort_values('Date').reset_index(drop=True)
+        # Net Pozisyonları Hesapla
+        full_df['Net_Fon'] = full_df['Fon_Long'] - full_df['Fon_Short']
+        full_df['Net_Ticari'] = full_df['Ticari_Long'] - full_df['Ticari_Short']
+        return full_df
+    return pd.DataFrame()
+
+def calculate_cot_trends(df):
+    if df.empty or len(df) < 5: return None
+    
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
+    month_ago = df.iloc[-5] if len(df) >= 5 else df.iloc[0]
+    
+    # Fon Trendi
+    fund_change_week = last_row['Net_Fon'] - prev_row['Net_Fon']
+    fund_change_month = last_row['Net_Fon'] - month_ago['Net_Fon']
+    
+    fund_trend = "🟢 Artıyor" if fund_change_month > 0 else "🔴 Azalıyor"
+    comm_trend = "🟢 Artıyor" if (last_row['Net_Ticari'] - month_ago['Net_Ticari']) > 0 else "🔴 Azalıyor"
+    
+    return {
+        "current": last_row,
+        "fund_chg_w": fund_change_week,
+        "fund_trend": fund_trend,
+        "comm_trend": comm_trend,
+        "df_6mo": df.tail(26) # Son 6 ay (26 hafta)
+    }
 
 def calculate_indicators(df):
     delta = df['Pamuk'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -186,6 +264,10 @@ if check_login():
     if 'w_news' not in st.session_state: st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
     def set_auto_weights(): st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
 
+    # COT ANALİZİ BAŞLAT
+    cot_hist_df = get_historical_cot()
+    cot_analysis = calculate_cot_trends(cot_hist_df)
+
     with st.sidebar:
         st.markdown("## ☁️ Menü")
         menu = st.radio("", ["📊 Ana Ekran", "⚖️ Karşılaştırma", "🦊 Pozisyonlar (COT)", "🤖 AI Strateji", "📉 Teknik"], label_visibility="collapsed")
@@ -216,10 +298,12 @@ if check_login():
     usdcny = float(df_hist['USDCNY'].iloc[-1]) if 'USDCNY' in df_hist else 7.2
     poly_cent = (poly_rmb / usdcny / 2204.62) * 100
 
-    if 'cot_data' not in st.session_state: st.session_state['cot_data'] = {"cl": 15000, "cs": 65000, "fl": 40000, "fs": 20000}
-    cot = st.session_state['cot_data']
-    fix_ratio = (cot['cs'] / (cot['cl']+cot['cs']+cot['fl']+cot['fs'])) * 100
-    cot_summary = f"Ticari Short: {cot['cs']}, Fon Long: {cot['fl']}, Fix: {fix_ratio:.1f}%"
+    # COT Özet Metni
+    if cot_analysis:
+        curr = cot_analysis['current']
+        cot_summary = f"Tarih: {curr['Date'].strftime('%Y-%m-%d')} | Fon Net: {curr['Net_Fon']} ({cot_analysis['fund_trend']}), Ticari Net: {curr['Net_Ticari']} ({cot_analysis['comm_trend']})"
+    else:
+        cot_summary = "COT Verisi Bekleniyor..."
 
     if live_price > 0: display_price = live_price; display_change = live_change
     else:
@@ -284,19 +368,45 @@ if check_login():
         else: st.warning("Seçilen varlık için veri çekilemedi.")
 
     elif menu == "🦊 Pozisyonlar (COT)":
-        st.subheader("Piyasa Oyuncu Dağılımı")
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.info("Manuel Veri Girişi")
-            new_cl = st.number_input("Ticari Long", value=cot['cl'])
-            new_cs = st.number_input("Ticari Short (Fix)", value=cot['cs'])
-            new_fl = st.number_input("Fon Long", value=cot['fl'])
-            new_fs = st.number_input("Fon Short", value=cot['fs'])
-            st.session_state['cot_data'] = {"cl": new_cl, "cs": new_cs, "fl": new_fl, "fs": new_fs}
-        with c2:
-            fig_pie = go.Figure(data=[go.Pie(labels=['Fix (Short)', 'Tic. Long', 'Fon Long', 'Fon Short'], values=[new_cs, new_cl, new_fl, new_fs], hole=.5)])
-            fig_pie.update_layout(template="plotly_white")
-            st.plotly_chart(fig_pie, use_container_width=True)
+        if cot_analysis:
+            curr = cot_analysis['current']
+            st.subheader(f"🦊 COT Analizi ({curr['Date'].strftime('%Y-%m-%d')})")
+            
+            # ÜST KARTLAR (TREND GÖSTERGELİ)
+            k1, k2, k3, k4 = st.columns(4)
+            
+            # Fon (Spekülatör) Verisi
+            fon_delta = cot_analysis['fund_chg_w']
+            k1.metric("Fon Net (Long-Short)", f"{curr['Net_Fon']:,}", f"{fon_delta:,}", delta_color="normal")
+            k2.metric("Fon İştahı (Aylık)", cot_analysis['fund_trend'], delta_color="off")
+            
+            # Ticari (Sanayici) Verisi
+            k3.metric("Ticari Net (Hedger)", f"{curr['Net_Ticari']:,}", delta_color="off") # Genelde negatiftir, renk kafa karıştırmasın
+            k4.metric("Ticari Davranış", cot_analysis['comm_trend'], delta_color="off")
+            
+            st.divider()
+            
+            # 6 AYLIK TREND GRAFİĞİ
+            st.markdown("### 📊 Son 6 Ay: Fon vs. Ticari Savaşı")
+            df6 = cot_analysis['df_6mo']
+            
+            fig_cot = go.Figure()
+            # Fon Çizgisi (Yeşil - Çünkü fiyatı onlar sürer)
+            fig_cot.add_trace(go.Scatter(x=df6['Date'], y=df6['Net_Fon'], name='Fon Net Pozisyonu', 
+                                         line=dict(color='#10B981', width=3), fill='tozeroy', fillcolor='rgba(16, 185, 129, 0.1)'))
+            
+            # Ticari Çizgisi (Kırmızı/Gri - Çünkü onlar genelde Shorttur)
+            fig_cot.add_trace(go.Scatter(x=df6['Date'], y=df6['Net_Ticari'], name='Ticari Net Pozisyonu', 
+                                         line=dict(color='#6B7280', width=2, dash='dot')))
+            
+            fig_cot.add_hline(y=0, line_width=1, line_color="black")
+            fig_cot.update_layout(height=400, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.1))
+            st.plotly_chart(fig_cot, use_container_width=True)
+            
+            st.caption("ℹ️ **Fon Pozisyonu (Yeşil):** Sıfırın üzerindeyse ve artıyorsa Fiyat Yükselebilir. Düşüyorsa satış baskısı vardır.\nℹ️ **Ticari Pozisyon (Gri):** Üretici ve Fabrikaların korunma amaçlı işlemleridir. Genelde fiyatın tersine hareket ederler.")
+            
+        else:
+            st.warning("⚠️ Geçmiş COT verileri indiriliyor veya CFTC sunucularına ulaşılamadı. Lütfen sayfayı yenileyin.")
 
     elif menu == "🤖 AI Strateji":
         st.subheader("Yapay Zeka Analisti")
