@@ -93,13 +93,18 @@ def get_market_history(period_str):
         return df.dropna()
     except: return pd.DataFrame()
 
-# --- YENİ: KARŞILAŞTIRMA İÇİN VERİ ÇEKİCİ ---
+# --- DÜZELTİLEN FONKSİYON (SQUEEZE EKLENDİ) ---
 @st.cache_data(ttl=600)
 def get_comparison_data(ticker, period_str):
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
     try:
         data = yf.download(ticker, period=mapping[period_str], progress=False)
-        return data['Close'] if not data.empty else pd.Series()
+        # HATA DÜZELTME: Gelen veriyi tek boyuta indir (squeeze) ve MultiIndex temizle
+        if not data.empty:
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            return data['Close'].squeeze()
+        return pd.Series()
     except: return pd.Series()
 
 def calculate_indicators(df):
@@ -247,66 +252,36 @@ if check_login():
 
     elif menu == "⚖️ Karşılaştırma":
         st.subheader("⚖️ Emtia & Varlık Karşılaştırma")
-        
-        # Varlık Havuzu
-        comp_assets = {
-            "Mısır (Corn)": "ZC=F",
-            "Soya (Soybean)": "ZS=F",
-            "Buğday (Wheat)": "ZW=F",
-            "Şeker (Sugar)": "SB=F",
-            "Kahve (Coffee)": "KC=F",
-            "Petrol (Brent)": "BZ=F",
-            "Altın (Gold)": "GC=F"
-        }
-        
+        comp_assets = {"Mısır (Corn)": "ZC=F", "Soya (Soybean)": "ZS=F", "Buğday (Wheat)": "ZW=F", "Şeker (Sugar)": "SB=F", "Kahve (Coffee)": "KC=F", "Petrol (Brent)": "BZ=F", "Altın (Gold)": "GC=F"}
         col_sel1, col_sel2 = st.columns(2)
-        with col_sel1:
-            selected_asset_name = st.selectbox("Kıyaslanacak Varlık:", list(comp_assets.keys()))
-        with col_sel2:
-            view_mode = st.radio("Grafik Modu:", ["Yüzdesel Getiri (%)", "Fiyat (Dolar)"], horizontal=True)
-
+        with col_sel1: selected_asset_name = st.selectbox("Kıyaslanacak Varlık:", list(comp_assets.keys()))
+        with col_sel2: view_mode = st.radio("Grafik Modu:", ["Yüzdesel Getiri (%)", "Fiyat (Dolar)"], horizontal=True)
         selected_ticker = comp_assets[selected_asset_name]
-        
-        # Verileri Hazırla
         cotton_series = df_hist['Pamuk']
         target_series = get_comparison_data(selected_ticker, period)
-        
         if not target_series.empty:
-            # Verileri aynı tarihlere eşitle
             df_comp = pd.DataFrame({'Pamuk': cotton_series, 'Rakip': target_series}).dropna()
-            
-            # Korelasyon Hesapla
             correlation = df_comp['Pamuk'].corr(df_comp['Rakip'])
-            
-            # Korelasyon Kartı
             col_k1, col_k2 = st.columns([1, 3])
             with col_k1:
-                color = "green" if correlation > 0.5 else "red" if correlation < -0.5 else "gray"
                 st.metric("Korelasyon Katsayısı", f"{correlation:.2f}", delta_color="off")
-                st.caption(f"1.00: Birebir aynı hareket\n0.00: İlgisiz\n-1.00: Ters hareket")
-            
+                st.caption(f"1.00: Birebir aynı\n0.00: İlgisiz\n-1.00: Ters hareket")
             with col_k2:
                 fig_comp = go.Figure()
-                
                 if view_mode == "Yüzdesel Getiri (%)":
-                    # Yüzdesel Normalize Et (Başlangıç = 0)
                     norm_cotton = ((df_comp['Pamuk'] - df_comp['Pamuk'].iloc[0]) / df_comp['Pamuk'].iloc[0]) * 100
                     norm_target = ((df_comp['Rakip'] - df_comp['Rakip'].iloc[0]) / df_comp['Rakip'].iloc[0]) * 100
-                    
                     fig_comp.add_trace(go.Scatter(x=df_comp.index, y=norm_cotton, name='Pamuk (%)', line=dict(color='#1E3A8A', width=3)))
                     fig_comp.add_trace(go.Scatter(x=df_comp.index, y=norm_target, name=f'{selected_asset_name.split()[0]} (%)', line=dict(color='#EA580C', width=2)))
                     yaxis_title = "Getiri (%)"
                 else:
-                    # Fiyat Modu (Çift Eksen)
                     fig_comp.add_trace(go.Scatter(x=df_comp.index, y=df_comp['Pamuk'], name='Pamuk (Cent)', line=dict(color='#1E3A8A', width=3)))
                     fig_comp.add_trace(go.Scatter(x=df_comp.index, y=df_comp['Rakip'], name=f'{selected_asset_name.split()[0]}', line=dict(color='#EA580C', width=2, dash='dot'), yaxis='y2'))
                     yaxis_title = "Pamuk Fiyatı"
                     fig_comp.update_layout(yaxis2=dict(overlaying='y', side='right', showgrid=False, title=selected_asset_name))
-
                 fig_comp.update_layout(height=450, template="plotly_white", margin=dict(l=20,r=20,t=20,b=20), hovermode="x unified", yaxis_title=yaxis_title, legend=dict(orientation="h", y=1.1))
                 st.plotly_chart(fig_comp, use_container_width=True)
-        else:
-            st.warning("Seçilen varlık için veri çekilemedi.")
+        else: st.warning("Seçilen varlık için veri çekilemedi.")
 
     elif menu == "🦊 Pozisyonlar (COT)":
         st.subheader("Piyasa Oyuncu Dağılımı")
