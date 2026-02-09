@@ -34,12 +34,64 @@ st.markdown("""
     }
     h1, h2, h3 {color: #0F172A; font-family: 'Helvetica Neue', sans-serif; font-weight: 700;}
     section[data-testid="stSidebar"] {background-color: #F8F9FA; border-right: 1px solid #E5E7EB;}
-    .success-box {padding: 10px; background-color: #D1FAE5; color: #065F46; border-radius: 5px; margin-bottom: 10px; font-size: 0.9em;}
-    .warning-box {padding: 10px; background-color: #FEF3C7; color: #92400E; border-radius: 5px; margin-bottom: 10px; font-size: 0.9em;}
+    .rollover-box {
+        padding: 15px; 
+        border-radius: 8px; 
+        margin-bottom: 20px; 
+        font-weight: bold;
+        text-align: center;
+    }
+    .safe {background-color: #D1FAE5; color: #065F46; border: 1px solid #34D399;}
+    .danger {background-color: #FEE2E2; color: #991B1B; border: 1px solid #F87171;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. VERİ MOTORLARI ---
+# --- 2. YARDIMCI FONKSİYONLAR (VADE & TICKER) ---
+def get_next_contract_ticker():
+    """Bugünün tarihine göre bir sonraki pamuk kontratının kodunu üretir."""
+    # Pamuk Vadeleri: Mart(H), Mayıs(K), Temmuz(N), Ekim(V), Aralık(Z)
+    months = {3: 'H', 5: 'K', 7: 'N', 10: 'V', 12: 'Z'}
+    now = datetime.now()
+    curr_month = now.month
+    curr_year = now.year % 100 # Sadece son iki hane (26 gibi)
+    
+    # Sıradaki ilk vadeyi bul
+    next_c_month = None
+    next_c_year = curr_year
+    
+    sorted_months = sorted(months.keys())
+    for m in sorted_months:
+        if m > curr_month:
+            next_c_month = m
+            break
+            
+    if next_c_month is None: # Yıl bitmiş, sonraki yılın Mart'ı
+        next_c_month = 3
+        next_c_year += 1
+        
+    # Kod formatı: CT + Harf + Yıl + .NYB (Örn: CTK26.NYB)
+    ticker = f"CT{months[next_c_month]}{next_c_year}.NYB"
+    return ticker, months[next_c_month], f"20{next_c_year}"
+
+def check_rollover_status():
+    """Vade sonuna ne kadar kaldığını hesaplar."""
+    # Pamukta FND (First Notice Day) genelde vade ayından önceki ayın son haftasıdır.
+    # Basit kural: Kontrat ayının 1'inden 10 gün önce risk başlar.
+    
+    now = datetime.now()
+    # Aktif aylar: 3, 5, 7, 10, 12. 
+    # Riskli aylar (Vade sonu yaklaşan): 2, 4, 6, 9, 11
+    
+    risky_mapping = {2:3, 4:5, 6:7, 9:10, 11:12} # Şubat'taysak Mart vadesi risklidir.
+    
+    if now.month in risky_mapping and now.day > 15:
+        target_contract = risky_mapping[now.month]
+        days_left = 30 - now.day # Kabaca ay sonuna kalan gün
+        return True, f"⚠️ DİKKAT: Vade Sonu Yaklaşıyor! (Tahmini {days_left} gün kaldı). Fiyatlarda 'Squeeze' (Sıkışma) olabilir. Sonraki vadeyi kontrol edin.", target_contract
+    
+    return False, "✅ Piyasa Normal: Vade ortasındayız, likidite sağlıklı.", None
+
+# --- 3. VERİ MOTORLARI ---
 @st.cache_data(ttl=10)
 def get_live_price():
     try:
@@ -49,9 +101,41 @@ def get_live_price():
     except: return 0.0, 0.0
 
 @st.cache_data(ttl=60)
+def get_market_history(period_str):
+    import yfinance as yf
+    mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
+    
+    # 1. Ana Veriyi Çek (CT=F)
+    try:
+        main_data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
+    except: main_data = pd.DataFrame()
+
+    # 2. Sonraki Vadeyi Çek (Spread İçin)
+    next_ticker, _, _ = get_next_contract_ticker()
+    try:
+        next_data = yf.download(next_ticker, period=mapping[period_str], progress=False, threads=False)
+    except: next_data = pd.DataFrame()
+
+    df = pd.DataFrame()
+    if not main_data.empty:
+        if 'CT=F' in main_data: df['Pamuk'] = main_data['CT=F']['Close']
+        if 'BZ=F' in main_data: df['Petrol'] = main_data['BZ=F']['Close']
+        if 'DX-Y.NYB' in main_data: df['DXY'] = main_data['DX-Y.NYB']['Close']
+        if 'CNY=X' in main_data: df['USDCNY'] = main_data['CNY=X']['Close']
+        
+        # Sonraki Vadeyi Ekle (Eğer veri geldiyse)
+        if not next_data.empty:
+            # Endeksleri eşitle
+            df['Pamuk_Next'] = next_data['Close']
+        else:
+            df['Pamuk_Next'] = None
+
+    return df.dropna(subset=['Pamuk']) # Sadece ana veri yoksa düşür
+
+@st.cache_data(ttl=60)
 def get_futures_table():
     url = "https://futures.tradingcharts.com/futures/quotes/ct.html?cbase=ct"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = requests.get(url, headers=headers, timeout=5)
         if r.status_code == 200:
@@ -65,47 +149,11 @@ def get_futures_table():
                 raw_df['Last_Clean'] = raw_df['Last'].apply(clean)
                 raw_df['Chg_Clean'] = raw_df['Chg'].apply(clean)
                 final_df = raw_df.dropna(subset=['Last_Clean']).rename(columns={'Last_Clean': 'Son', 'Chg_Clean': 'Değişim', 'Month': 'Vade', 'Vol': 'Hacim'})
-                cash_row = final_df[final_df['Vade'].astype(str).str.contains("Cash", case=False, na=False)]
                 futures_df = final_df[~final_df['Vade'].astype(str).str.contains("Cash", case=False, na=False)]
-                if not cash_row.empty:
-                    return pd.concat([cash_row, futures_df])[['Vade', 'Son', 'Değişim', 'Hacim']].reset_index(drop=True), "Canlı Veri (Spot)"
-                elif not futures_df.empty:
+                if not futures_df.empty:
                     return futures_df[['Vade', 'Son', 'Değişim', 'Hacim']].reset_index(drop=True), "Canlı Veri (Vadeli)"
     except: pass
-    
-    month_map = {3: 'H', 5: 'K', 7: 'N', 12: 'Z'} 
-    curr_date = datetime.now(); rows = []
-    for i in range(24): 
-        future_date = curr_date + timedelta(days=30*i)
-        m, y = future_date.month, future_date.year
-        if m in month_map:
-            sym = f"CT{month_map[m]}{str(y)[-2:]}.NYB"; name = f"{future_date.strftime('%b')}'{str(y)[-2:]}"
-            if y > curr_date.year or (y == curr_date.year and m >= curr_date.month):
-                try:
-                    import yfinance as yf
-                    t = yf.Ticker(sym); hist = t.history(period="5d")
-                    if not hist.empty: rows.append({"Vade": name, "Son": float(hist['Close'].iloc[-1]), "Değişim": float(hist['Close'].iloc[-1] - (hist['Close'].iloc[-2] if len(hist)>1 else hist['Close'].iloc[-1])), "Hacim": int(hist['Volume'].iloc[-1])})
-                except: continue
-                if len(rows) >= 8: break
-    return pd.DataFrame(rows) if rows else pd.DataFrame(), "Yedek Veri" if rows else "Veri Yok"
-
-@st.cache_data(ttl=60)
-def get_market_history(period_str):
-    import yfinance as yf
-    mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
-    for attempt in range(3):
-        try:
-            data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
-            df = pd.DataFrame()
-            if not data.empty:
-                if 'CT=F' in data: df['Pamuk'] = data['CT=F']['Close']
-                if 'BZ=F' in data: df['Petrol'] = data['BZ=F']['Close']
-                if 'DX-Y.NYB' in data: df['DXY'] = data['DX-Y.NYB']['Close']
-                if 'CNY=X' in data: df['USDCNY'] = data['CNY=X']['Close']
-                result = df.dropna()
-                if not result.empty: return result
-        except: time.sleep(1)
-    return pd.DataFrame()
+    return pd.DataFrame(), "Veri Yok"
 
 @st.cache_data(ttl=600)
 def get_comparison_data(ticker, period_str):
@@ -120,7 +168,7 @@ def get_comparison_data(ticker, period_str):
         return pd.Series()
     except: return pd.Series()
 
-# --- GELİŞMİŞ COT ANALİZİ ---
+# --- COT ---
 def parse_cftc_file(file_obj):
     try:
         df = pd.read_csv(file_obj, header=None, low_memory=False)
@@ -144,7 +192,6 @@ def get_cot_data(uploaded_file=None):
     if uploaded_file is not None:
         df = parse_cftc_file(uploaded_file)
         if not df.empty: return df, "✅ Anlık Yüklenen Dosya"
-
     local_files = glob.glob("cot_history*.csv")
     if local_files:
         combined_dfs = []
@@ -155,7 +202,6 @@ def get_cot_data(uploaded_file=None):
         if combined_dfs:
             full_df = pd.concat(combined_dfs).drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
             return full_df, f"✅ Sistem Veritabanı ({len(local_files)} Dosya)"
-
     try:
         url = "https://www.cftc.gov/dea/newcot/ice_lf.txt"
         r = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
@@ -237,21 +283,15 @@ def parse_ai_chart_data(text):
 def check_login():
     if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
     if not st.session_state['logged_in']:
-        # LOGO VE ORTALAMA (CSS İLE GARANTİ)
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown("<br><br>", unsafe_allow_html=True)
             if os.path.exists("logo.png"):
-                # Görüntüyü base64'e çevirip HTML ile ortalayarak basıyoruz (En sağlam yöntem)
                 with open("logo.png", "rb") as f:
                     data = base64.b64encode(f.read()).decode("utf-8")
-                st.markdown(
-                    f'<div style="text-align: center;"><img src="data:image/png;base64,{data}" width="300"></div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div style="text-align: center;"><img src="data:image/png;base64,{data}" width="300"></div>', unsafe_allow_html=True)
             else:
                 st.markdown("<h2 style='text-align: center;'>☁️ Cotton Geni's</h2>", unsafe_allow_html=True)
-            
             st.markdown("<h4 style='text-align: center;'>Giriş Yap</h4>", unsafe_allow_html=True)
             user = st.text_input("Kullanıcı Adı")
             passwd = st.text_input("Şifre", type="password")
@@ -270,31 +310,20 @@ if check_login():
     if 'w_news' not in st.session_state: st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
     def set_auto_weights(): st.session_state.update({'w_news': 9, 'w_cot': 7, 'w_tech': 5, 'w_poly': 8, 'w_basis': 6})
 
-    # SIDEBAR
     with st.sidebar:
-        # --- LOGO ALANI (YAN MENÜ) ---
         if os.path.exists("logo.png"):
             st.image("logo.png", width=200)
         else:
-            st.markdown("""
-                <div style="text-align: center;">
-                    <h1 style="font-size: 60px; margin:0;">☁️</h1>
-                    <h3 style="color: #0F172A;">Cotton Geni's</h3>
-                </div>
-            """, unsafe_allow_html=True)
-            
+            st.markdown("<div style='text-align: center;'><h1>☁️</h1><h3>Cotton Geni's</h3></div>", unsafe_allow_html=True)
         st.markdown("## ☁️ Menü")
         menu = st.radio("", ["📊 Ana Ekran", "⚖️ Karşılaştırma", "🦊 Pozisyonlar (COT)", "🤖 AI Strateji", "📉 Teknik"], label_visibility="collapsed")
         st.divider()
-        
         with st.expander("💾 Veri Yönetimi (COT)", expanded=False):
             st.info("Eğer otomatik veri gelmiyorsa, CFTC raporunu (Text) buradan yükleyebilirsiniz.")
             uploaded_cot = st.file_uploader("CFTC Raporu Yükle", type=['txt', 'csv'])
-        
         with st.expander("⚙️ Veri & Grafik Ayarları"):
             poly_rmb = st.number_input("Polyester (RMB)", value=6587)
             period = st.selectbox("Grafik Süresi", ["3 Ay", "6 Ay", "1 Yıl", "3 Yıl"], index=1)
-        
         with st.expander("🧠 AI Karar Mekanizması", expanded=False):
             st.caption("AI Analiz Ağırlıkları (0-10)")
             st.session_state['w_news'] = st.slider("Haberler", 0, 10, st.session_state['w_news'])
@@ -305,10 +334,10 @@ if check_login():
             if st.button("✨ Otomatik", use_container_width=True): set_auto_weights(); st.rerun()
         if st.button("Çıkış", type="secondary"): st.session_state['logged_in'] = False; st.rerun()
 
-    # --- VERİ HAZIRLIĞI ---
+    # --- VERİ VE HAZIRLIK ---
     cot_df, cot_source = get_cot_data(uploaded_cot)
     cot_analysis = calculate_cot_trends(cot_df)
-
+    
     live_price, live_change = get_live_price()
     table_data, table_source = get_futures_table()
     df_hist = get_market_history(period)
@@ -323,13 +352,17 @@ if check_login():
     if cot_analysis and cot_analysis['current'] is not None:
         curr = cot_analysis['current']
         cot_summary = f"Tarih: {curr['Date'].strftime('%Y-%m-%d')} | Fon Net: {curr['Net_Fon']} ({cot_analysis['fund_trend']}), Ticari Net: {curr['Net_Ticari']} ({cot_analysis['comm_trend']})"
-    else:
-        cot_summary = "COT Verisi Yok"
+    else: cot_summary = "COT Verisi Yok"
 
     if live_price > 0: display_price = live_price; display_change = live_change
     else:
         if not table_data.empty: display_price = float(table_data.iloc[0]['Son']); display_change = float(table_data.iloc[0]['Değişim'])
         else: display_price = df_hist['Pamuk'].iloc[-1]; display_change = 0.0
+
+    # --- ROLLOVER KONTROLÜ VE UYARI ---
+    is_rollover, msg, roll_contract = check_rollover_status()
+    if is_rollover:
+        st.markdown(f'<div class="rollover-box danger">{msg}</div>', unsafe_allow_html=True)
 
     # --- EKRANLAR ---
     if menu == "📊 Ana Ekran":
@@ -339,12 +372,26 @@ if check_login():
         c3.metric("Sentetik", f"{poly_cent:.2f}c", "Piyasa")
         c4.metric("DXY", f"{df_hist['DXY'].iloc[-1]:.2f}", f"{df_hist['DXY'].iloc[-1]-df_hist['DXY'].iloc[-2]:.2f}")
         st.markdown("<br>", unsafe_allow_html=True)
-        st.subheader("📈 Fiyat Grafiği")
+        
+        # --- SPREAD GRAFİĞİ ---
+        st.subheader("📈 Fiyat Grafiği (Vade Karşılaştırmalı)")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Pamuk', line=dict(color='#1E3A8A', width=3)))
+        # Aktif Vade (Mavi)
+        fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Mevcut Vade (Spot)', line=dict(color='#1E3A8A', width=3)))
+        
+        # Sonraki Vade (Turkuaz - Spread Kontrolü İçin)
+        if 'Pamuk_Next' in df_hist and not df_hist['Pamuk_Next'].isnull().all():
+            next_ticker_name, _, _ = get_next_contract_ticker()
+            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk_Next'], name=f'Sonraki Vade ({next_ticker_name})', line=dict(color='#06B6D4', width=2, dash='dash')))
+        
+        # Petrol (Kırmızı)
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
+        
         fig.update_layout(height=500, template="plotly_white", margin=dict(l=20,r=20,t=40,b=20), yaxis2=dict(overlaying='y', side='right', showgrid=False), legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
+        
+        st.info("ℹ️ **Turkuaz Çizgi (Sonraki Vade):** Eğer Mavi çizgi Turkuaz'ın çok üzerindeyse, fiyatların düşmesi beklenir (Backwardation). Eğer altındaysa, stok maliyeti nedeniyle yükseliş normaldir (Contango).")
+
         st.divider()
         col_l, col_r = st.columns([1, 1])
         with col_l:
