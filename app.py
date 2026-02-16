@@ -48,14 +48,11 @@ st.markdown("""
 
 # --- 2. YARDIMCI FONKSİYONLAR (VADE & TICKER) ---
 def get_next_contract_ticker():
-    """Bugünün tarihine göre bir sonraki pamuk kontratının kodunu üretir."""
-    # Pamuk Vadeleri: Mart(H), Mayıs(K), Temmuz(N), Ekim(V), Aralık(Z)
     months = {3: 'H', 5: 'K', 7: 'N', 10: 'V', 12: 'Z'}
     now = datetime.now()
     curr_month = now.month
-    curr_year = now.year % 100 # Sadece son iki hane (26 gibi)
+    curr_year = now.year % 100 
     
-    # Sıradaki ilk vadeyi bul
     next_c_month = None
     next_c_year = curr_year
     
@@ -65,31 +62,24 @@ def get_next_contract_ticker():
             next_c_month = m
             break
             
-    if next_c_month is None: # Yıl bitmiş, sonraki yılın Mart'ı
+    if next_c_month is None: 
         next_c_month = 3
         next_c_year += 1
         
-    # Kod formatı: CT + Harf + Yıl + .NYB (Örn: CTK26.NYB)
     ticker = f"CT{months[next_c_month]}{next_c_year}.NYB"
     return ticker, months[next_c_month], f"20{next_c_year}"
 
 def check_rollover_status():
-    """Vade sonuna ne kadar kaldığını hesaplar."""
-    # Pamukta FND (First Notice Day) genelde vade ayından önceki ayın son haftasıdır.
-    # Basit kural: Kontrat ayının 1'inden 10 gün önce risk başlar.
-    
     now = datetime.now()
-    # Aktif aylar: 3, 5, 7, 10, 12. 
     # Riskli aylar (Vade sonu yaklaşan): 2, 4, 6, 9, 11
-    
-    risky_mapping = {2:3, 4:5, 6:7, 9:10, 11:12} # Şubat'taysak Mart vadesi risklidir.
+    risky_mapping = {2:3, 4:5, 6:7, 9:10, 11:12} 
     
     if now.month in risky_mapping and now.day > 15:
         target_contract = risky_mapping[now.month]
-        days_left = 30 - now.day # Kabaca ay sonuna kalan gün
-        return True, f"⚠️ DİKKAT: Vade Sonu Yaklaşıyor! (Tahmini {days_left} gün kaldı). Fiyatlarda 'Squeeze' (Sıkışma) olabilir. Sonraki vadeyi kontrol edin.", target_contract
+        days_left = 30 - now.day
+        return True, f"⚠️ DİKKAT: Mart Kontratı Bitiyor! ({days_left} gün kaldı). Yapay Zeka, analiz için otomatik olarak MAYIS (Sonraki) kontrat fiyatını baz alacaktır.", target_contract
     
-    return False, "✅ Piyasa Normal: Vade ortasındayız, likidite sağlıklı.", None
+    return False, "✅ Piyasa Normal: Vade ortasındayız.", None
 
 # --- 3. VERİ MOTORLARI ---
 @st.cache_data(ttl=10)
@@ -105,10 +95,13 @@ def get_market_history(period_str):
     import yfinance as yf
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
     
-    # 1. Ana Veriyi Çek (CT=F)
-    try:
-        main_data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
-    except: main_data = pd.DataFrame()
+    # 1. Ana Veriyi Çek (CT=F - Sürekli Kontrat)
+    for attempt in range(3):
+        try:
+            main_data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
+            if not main_data.empty: break
+        except: time.sleep(1)
+    else: main_data = pd.DataFrame() # 3 denemede de gelmezse boş dön
 
     # 2. Sonraki Vadeyi Çek (Spread İçin)
     next_ticker, _, _ = get_next_contract_ticker()
@@ -123,14 +116,12 @@ def get_market_history(period_str):
         if 'DX-Y.NYB' in main_data: df['DXY'] = main_data['DX-Y.NYB']['Close']
         if 'CNY=X' in main_data: df['USDCNY'] = main_data['CNY=X']['Close']
         
-        # Sonraki Vadeyi Ekle (Eğer veri geldiyse)
         if not next_data.empty:
-            # Endeksleri eşitle
             df['Pamuk_Next'] = next_data['Close']
         else:
             df['Pamuk_Next'] = None
 
-    return df.dropna(subset=['Pamuk']) # Sadece ana veri yoksa düşür
+    return df.dropna(subset=['Pamuk'])
 
 @st.cache_data(ttl=60)
 def get_futures_table():
@@ -253,21 +244,34 @@ def get_intel_news():
     except: pass
     return pd.DataFrame(news_data)
 
-def ask_gemini_with_chart(api_key, spot_val, news_df, table_df, poly_cent, cot_summary, scenario, weights):
+# --- YENİ AI ANALİZ FONKSİYONU (SMART ROLLOVER) ---
+def ask_gemini_with_chart(api_key, spot_val, next_val, is_rollover, news_df, table_df, poly_cent, cot_summary, scenario, weights):
     try:
         genai.configure(api_key=api_key)
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         model = genai.GenerativeModel(next((m for m in models if 'flash' in m), models[0] if models else None))
         table_txt = table_df.to_string(index=False) if not table_df.empty else "Veri Yok"
         priority_instruction = "AĞIRLIKLAR (0-10):\n" + "\n".join([f"- {k}: {v}" for k,v in weights.items()])
+        
+        # ROLLOVER MANTIĞI: Eğer risk varsa, AI'a sonraki vade fiyatını veriyoruz
+        base_price = next_val if is_rollover and next_val > 0 else spot_val
+        rollover_note = "⚠️ ÖNEMLİ: Vade sonu (Rollover) dönemindeyiz. Analizini ve gelecek projeksiyonunu, hacimsiz kalan spot fiyat yerine, daha sağlıklı olan GELECEK VADE FİYATI üzerinden yap." if is_rollover else ""
+        
         prompt = f"""Sen Profesyonel Pamuk Tüccarısın. {priority_instruction}
-        BUGÜN: {datetime.now().strftime("%Y-%m-%d")} | FİYAT: {spot_val:.2f}c | RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} 
+        
+        {rollover_note}
+        
+        REFERANS FİYAT: {base_price:.2f}c (Analizini bu fiyat üzerinden kur)
+        MEVCUT SPOT: {spot_val:.2f}c | SONRAKİ VADE: {next_val:.2f}c
+        RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} 
         TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"} 
         SENARYO: {scenario}
-        GÖREV: Fiyat yönünü belirle ve 1 yıllık 3 tahmin noktası (JSON) oluştur.
+        
+        GÖREV: Fiyat yönünü belirle ve REFERANS FİYAT baz alarak 1 yıllık 3 tahmin noktası (JSON) oluştur.
+        
         ÇIKTI FORMATI: ## 🧭 Stratejik Analiz \n* [Yorum...] \n## 🦊 Pozisyonlar \n* [Yorum...]
         ```json
-        {{ "forecast": [ {{"label": "Bugün", "date": "{datetime.now().strftime("%Y-%m-%d")}", "price": {spot_val}}}, {{"label": "Kısa Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Orta Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Uzun Vade", "date": "YYYY-MM-DD", "price": 00.00}} ] }}
+        {{ "forecast": [ {{"label": "Bugün", "date": "{datetime.now().strftime("%Y-%m-%d")}", "price": {base_price}}}, {{"label": "Kısa Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Orta Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Uzun Vade", "date": "YYYY-MM-DD", "price": 00.00}} ] }}
         ```"""
         return model.generate_content(prompt).text
     except Exception as e: return f"Hata: {str(e)}"
@@ -359,8 +363,13 @@ if check_login():
         if not table_data.empty: display_price = float(table_data.iloc[0]['Son']); display_change = float(table_data.iloc[0]['Değişim'])
         else: display_price = df_hist['Pamuk'].iloc[-1]; display_change = 0.0
 
-    # --- ROLLOVER KONTROLÜ VE UYARI ---
+    # --- ROLLOVER KONTROLÜ ---
     is_rollover, msg, roll_contract = check_rollover_status()
+    # Sonraki Vade Fiyatını Al (Grafikten)
+    next_price_val = 0.0
+    if 'Pamuk_Next' in df_hist and not df_hist['Pamuk_Next'].dropna().empty:
+        next_price_val = df_hist['Pamuk_Next'].iloc[-1]
+
     if is_rollover:
         st.markdown(f'<div class="rollover-box danger">{msg}</div>', unsafe_allow_html=True)
 
@@ -373,24 +382,16 @@ if check_login():
         c4.metric("DXY", f"{df_hist['DXY'].iloc[-1]:.2f}", f"{df_hist['DXY'].iloc[-1]-df_hist['DXY'].iloc[-2]:.2f}")
         st.markdown("<br>", unsafe_allow_html=True)
         
-        # --- SPREAD GRAFİĞİ ---
         st.subheader("📈 Fiyat Grafiği (Vade Karşılaştırmalı)")
         fig = go.Figure()
-        # Aktif Vade (Mavi)
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Mevcut Vade (Spot)', line=dict(color='#1E3A8A', width=3)))
-        
-        # Sonraki Vade (Turkuaz - Spread Kontrolü İçin)
-        if 'Pamuk_Next' in df_hist and not df_hist['Pamuk_Next'].isnull().all():
+        if next_price_val > 0:
             next_ticker_name, _, _ = get_next_contract_ticker()
             fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk_Next'], name=f'Sonraki Vade ({next_ticker_name})', line=dict(color='#06B6D4', width=2, dash='dash')))
-        
-        # Petrol (Kırmızı)
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
-        
         fig.update_layout(height=500, template="plotly_white", margin=dict(l=20,r=20,t=40,b=20), yaxis2=dict(overlaying='y', side='right', showgrid=False), legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
-        
-        st.info("ℹ️ **Turkuaz Çizgi (Sonraki Vade):** Eğer Mavi çizgi Turkuaz'ın çok üzerindeyse, fiyatların düşmesi beklenir (Backwardation). Eğer altındaysa, stok maliyeti nedeniyle yükseliş normaldir (Contango).")
+        st.info("ℹ️ **Turkuaz Çizgi:** Bir sonraki vade fiyatıdır. Vade sonlarında (Rollover) bu çizgi esas alınmalıdır.")
 
         st.divider()
         col_l, col_r = st.columns([1, 1])
@@ -439,11 +440,9 @@ if check_login():
         if cot_analysis and cot_analysis['current'] is not None:
             curr = cot_analysis['current']
             st.subheader(f"🦊 COT Analizi ({curr['Date'].strftime('%Y-%m-%d')})")
-            
             if "GitHub" in cot_source: st.markdown(f'<div class="success-box">{cot_source} kullanılıyor.</div>', unsafe_allow_html=True)
             elif "Anlık" in cot_source: st.markdown(f'<div class="success-box">{cot_source} (Geçici) kullanılıyor.</div>', unsafe_allow_html=True)
             else: st.markdown(f'<div class="warning-box">{cot_source}</div>', unsafe_allow_html=True)
-
             k1, k2, k3, k4 = st.columns(4)
             fon_delta = cot_analysis['fund_chg_w']
             k1.metric("Fon Net (Long-Short)", f"{curr['Net_Fon']:,}", f"{fon_delta:,}", delta_color="normal")
@@ -451,7 +450,6 @@ if check_login():
             k3.metric("Ticari Net (Hedger)", f"{curr['Net_Ticari']:,}", delta_color="off") 
             k4.metric("Ticari Davranış", cot_analysis['comm_trend'], delta_color="off")
             st.divider()
-            
             if len(cot_analysis['df_graph']) > 1:
                 st.markdown("### 📊 Fon vs. Ticari Savaşı (Son 1 Yıl)")
                 df6 = cot_analysis['df_graph']
@@ -461,10 +459,8 @@ if check_login():
                 fig_cot.add_hline(y=0, line_width=1, line_color="black")
                 fig_cot.update_layout(height=400, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.1))
                 st.plotly_chart(fig_cot, use_container_width=True)
-            else:
-                st.warning("⚠️ Grafik için yeterli tarihsel veri yok.")
-        else:
-            st.error("⚠️ Veri Bulunamadı. Lütfen sol menüden CFTC dosyasını yükleyin veya GitHub'a 'cot_history.csv' ekleyin.")
+            else: st.warning("⚠️ Grafik için yeterli tarihsel veri yok.")
+        else: st.error("⚠️ Veri Bulunamadı.")
 
     elif menu == "🤖 AI Strateji":
         st.subheader("Yapay Zeka Analisti")
@@ -472,14 +468,16 @@ if check_login():
         st.info(f"💡 AI Ağırlıkları: Haber={current_weights['Haberler']}, Teknik={current_weights['Teknik']}")
         scen = st.text_area("Senaryo / Soru:", placeholder="Örn: Faiz kararı sonrası pamuk ne olur?")
         if st.button("Analizi Başlat", type="primary") and api_key:
-            with st.spinner("AI piyasayı tarıyor..."):
-                report = ask_gemini_with_chart(api_key, display_price, news_df, table_data, poly_cent, cot_summary, scen, current_weights)
+            with st.spinner("AI piyasayı tarıyor (Rollover Kontrolü Yapılıyor)..."):
+                # YENİ EKLENEN KISIM: next_price_val değişkenini fonksiyona gönderiyoruz
+                report = ask_gemini_with_chart(api_key, display_price, next_price_val, is_rollover, news_df, table_data, poly_cent, cot_summary, scen, current_weights)
                 st.markdown(report.split("```json")[0])
                 forecast_df = parse_ai_chart_data(report)
                 if not forecast_df.empty:
                     st.divider(); st.subheader("🤖 AI Gelecek Projeksiyonu")
                     fig_ai = go.Figure()
                     short_hist = df_hist.tail(45)
+                    # Eğer rollover varsa geçmiş grafik ile tahmin arasında kopukluk olmasın diye görsel hile yapabiliriz ama şimdilik net kalsın.
                     fig_ai.add_trace(go.Scatter(x=short_hist.index, y=short_hist['Pamuk'], name='Gerçekleşen', line=dict(color='black', width=2)))
                     fig_ai.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['price'], name='AI Tahmini', mode='lines+markers+text', text=forecast_df['price'], line=dict(color='#10B981', width=3, dash='dot')))
                     fig_ai.update_layout(template="plotly_white", height=450)
