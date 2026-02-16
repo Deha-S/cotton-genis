@@ -47,49 +47,51 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. YARDIMCI FONKSİYONLAR (VADE & CURVE) ---
+# --- 2. YARDIMCI FONKSİYONLAR ---
+def safe_extract_close(df_or_series):
+    """Veriyi güvenli bir şekilde tekil fiyat serisine dönüştürür."""
+    try:
+        if df_or_series.empty: return pd.Series()
+        # Eğer MultiIndex sütun varsa (Price, Ticker) -> Sadece Close'u al
+        if isinstance(df_or_series, pd.DataFrame):
+            if 'Close' in df_or_series.columns:
+                return df_or_series['Close'].squeeze()
+            else:
+                return df_or_series.iloc[:, 0].squeeze() # İlk sütunu al
+        return df_or_series.squeeze()
+    except: return pd.Series()
+
 def get_forward_curve_tickers():
-    """Gelecek 12 ayın aktif kontratlarını bulur."""
-    # Pamuk Vadeleri: Mart(H), Mayıs(K), Temmuz(N), Ekim(V), Aralık(Z)
     months = {3: 'H', 5: 'K', 7: 'N', 10: 'V', 12: 'Z'}
     contract_list = []
-    
     now = datetime.now()
     curr_month = now.month
     curr_year = now.year % 100
     
-    # Önümüzdeki 4 kontratı bul
     check_month = curr_month
     check_year = curr_year
-    
     found_count = 0
+    
     while found_count < 4:
         if check_month in months:
-            # Geçmiş ayları atla (Vade sonuna 10 gün kala o ayı pas geçebiliriz ama şimdilik dahil edelim)
             if check_year > curr_year or (check_year == curr_year and check_month >= curr_month):
                 ticker = f"CT{months[check_month]}{check_year}.NYB"
                 label = f"{datetime(2000+check_year, check_month, 1).strftime('%b-%y')}"
                 contract_list.append({"ticker": ticker, "label": label})
                 found_count += 1
-        
         check_month += 1
         if check_month > 12:
             check_month = 1
             check_year += 1
-            
     return contract_list
 
 def check_rollover_status():
     now = datetime.now()
-    # Riskli aylar (Vade sonu yaklaşan): 2, 4, 6, 9, 11
-    # Eğer o ayın 15'ini geçtiysek bir sonraki vadeye odaklan uyarısı ver.
     risky_mapping = {2:3, 4:5, 6:7, 9:10, 11:12} 
-    
     if now.month in risky_mapping and now.day > 15:
         target_contract = risky_mapping[now.month]
         days_left = 30 - now.day
-        return True, f"⚠️ DİKKAT: Kontrat Dönüşümü (Rollover) Yaklaşıyor! ({days_left} gün). Yapay Zeka analizde vadeli işlem eğrisini (Forward Curve) baz alacaktır.", target_contract
-    
+        return True, f"⚠️ DİKKAT: Kontrat Dönüşümü (Rollover) Yaklaşıyor! ({days_left} gün). Analiz Forward Curve bazlı yapılacaktır.", target_contract
     return False, "✅ Piyasa Normal: Vade ortasındayız.", None
 
 # --- 3. VERİ MOTORLARI ---
@@ -103,39 +105,52 @@ def get_live_price():
 
 @st.cache_data(ttl=300)
 def get_forward_curve_data():
-    """Gelecek kontratların fiyatlarını çeker."""
     contracts = get_forward_curve_tickers()
     curve_data = {}
     curve_text = ""
-    
     for c in contracts:
         try:
             ticker = yf.Ticker(c['ticker'])
             hist = ticker.history(period="5d")
             if not hist.empty:
-                price = hist['Close'].iloc[-1]
+                price = float(hist['Close'].iloc[-1])
                 curve_data[c['label']] = price
                 curve_text += f"{c['label']}: {price:.2f}c | "
         except: pass
-        
     return curve_data, curve_text
 
 @st.cache_data(ttl=60)
 def get_market_history(period_str):
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
-    for attempt in range(3):
-        try:
-            data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
-            df = pd.DataFrame()
-            if not data.empty:
-                if 'CT=F' in data: df['Pamuk'] = data['CT=F']['Close']
-                if 'BZ=F' in data: df['Petrol'] = data['BZ=F']['Close']
-                if 'DX-Y.NYB' in data: df['DXY'] = data['DX-Y.NYB']['Close']
-                if 'CNY=X' in data: df['USDCNY'] = data['CNY=X']['Close']
-                result = df.dropna()
-                if not result.empty: return result
-        except: time.sleep(1)
-    return pd.DataFrame()
+    
+    # 1. Ana Veri
+    try:
+        main_data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
+    except: main_data = pd.DataFrame()
+
+    # 2. Sonraki Vade (Next Contract)
+    contracts = get_forward_curve_tickers()
+    next_ticker = contracts[1]['ticker'] if len(contracts) > 1 else "CTK26.NYB" # Listeden 2.yi al (1.si mevcut olabilir)
+    
+    try:
+        next_data = yf.download(next_ticker, period=mapping[period_str], progress=False, threads=False)
+    except: next_data = pd.DataFrame()
+
+    df = pd.DataFrame()
+    if not main_data.empty:
+        # Güvenli Veri Çekme (Squeeze ile)
+        df['Pamuk'] = safe_extract_close(main_data['CT=F']) if 'CT=F' in main_data else None
+        df['Petrol'] = safe_extract_close(main_data['BZ=F']) if 'BZ=F' in main_data else None
+        df['DXY'] = safe_extract_close(main_data['DX-Y.NYB']) if 'DX-Y.NYB' in main_data else None
+        df['USDCNY'] = safe_extract_close(main_data['CNY=X']) if 'CNY=X' in main_data else None
+        
+        # Sonraki Vadeyi Ekle
+        if not next_data.empty:
+            df['Pamuk_Next'] = safe_extract_close(next_data)
+        else:
+            df['Pamuk_Next'] = None
+
+    return df.dropna(subset=['Pamuk'])
 
 @st.cache_data(ttl=60)
 def get_futures_table():
@@ -163,14 +178,10 @@ def get_comparison_data(ticker, period_str):
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
     try:
         data = yf.download(ticker, period=mapping[period_str], progress=False)
-        if not data.empty:
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(0)
-            return data['Close'].squeeze()
-        return pd.Series()
+        return safe_extract_close(data)
     except: return pd.Series()
 
-# --- COT ---
+# --- COT & AI (Standart) ---
 def parse_cftc_file(file_obj):
     try:
         df = pd.read_csv(file_obj, header=None, low_memory=False)
@@ -255,7 +266,6 @@ def get_intel_news():
     except: pass
     return pd.DataFrame(news_data)
 
-# --- AI ANALİZ (V44.0 - FORWARD CURVE) ---
 def ask_gemini_with_chart(api_key, spot_val, curve_text, is_rollover, news_df, table_df, poly_cent, cot_summary, scenario, weights):
     try:
         genai.configure(api_key=api_key)
@@ -263,25 +273,15 @@ def ask_gemini_with_chart(api_key, spot_val, curve_text, is_rollover, news_df, t
         model = genai.GenerativeModel(next((m for m in models if 'flash' in m), models[0] if models else None))
         table_txt = table_df.to_string(index=False) if not table_df.empty else "Veri Yok"
         priority_instruction = "AĞIRLIKLAR (0-10):\n" + "\n".join([f"- {k}: {v}" for k,v in weights.items()])
-        
-        # ROLLOVER VE CURVE MESAJI
         curve_msg = f"VADELİ İŞLEM EĞRİSİ (Piyasa Beklentisi): {curve_text}"
         rollover_note = "⚠️ VADE DÖNÜŞÜMÜ (ROLLOVER) RİSKİ VAR." if is_rollover else ""
-        
         prompt = f"""Sen Profesyonel Pamuk Tüccarısın. {priority_instruction}
-        
         {rollover_note}
         {curve_msg}
-        
-        GÖREV: 
-        1. Mevcut spot fiyat ({spot_val:.2f}c) ile Vadeli İşlem Eğrisini kıyasla. 
-        2. Eğer ileri vadeler daha pahalıysa (Contango), tahminlerinde bu doğal yükselişi hesaba kat.
-        3. 6 Aylık ve 1 Yıllık hedeflerini, sadece bugünkü fiyata göre değil, Vadeli Eğrinin işaret ettiği seviyelere göre oluştur.
-        
+        GÖREV: Mevcut spot fiyat ({spot_val:.2f}c) ile Vadeli Eğriyi kıyasla. İleri vadeler pahalıysa (Contango) bunu hesaba kat.
         MEVCUT SPOT: {spot_val:.2f}c | RAKİP: Polyester {poly_cent:.2f}c | COT: {cot_summary} 
         TABLO: {table_txt} | HABERLER: {news_df['Orjinal'].to_string() if not news_df.empty else "Yok"} 
         SENARYO: {scenario}
-        
         ÇIKTI FORMATI: ## 🧭 Stratejik Analiz \n* [Yorum...] \n## 🦊 Pozisyonlar \n* [Yorum...]
         ```json
         {{ "forecast": [ {{"label": "Bugün", "date": "{datetime.now().strftime("%Y-%m-%d")}", "price": {spot_val}}}, {{"label": "Kısa Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Orta Vade", "date": "YYYY-MM-DD", "price": 00.00}}, {{"label": "Uzun Vade", "date": "YYYY-MM-DD", "price": 00.00}} ] }}
@@ -351,16 +351,13 @@ if check_login():
             if st.button("✨ Otomatik", use_container_width=True): set_auto_weights(); st.rerun()
         if st.button("Çıkış", type="secondary"): st.session_state['logged_in'] = False; st.rerun()
 
-    # --- VERİ VE HAZIRLIK ---
+    # --- VERİ HAZIRLIĞI ---
     cot_df, cot_source = get_cot_data(uploaded_cot)
     cot_analysis = calculate_cot_trends(cot_df)
-    
     live_price, live_change = get_live_price()
     table_data, table_source = get_futures_table()
     df_hist = get_market_history(period)
     news_df = get_intel_news()
-    
-    # FORWARD CURVE VERİSİNİ ÇEK
     curve_data, curve_text = get_forward_curve_data()
 
     if df_hist.empty: st.error("Fiyat verisi hatası. Lütfen sayfayı yenileyin."); st.stop()
@@ -379,7 +376,6 @@ if check_login():
         if not table_data.empty: display_price = float(table_data.iloc[0]['Son']); display_change = float(table_data.iloc[0]['Değişim'])
         else: display_price = df_hist['Pamuk'].iloc[-1]; display_change = 0.0
 
-    # --- ROLLOVER KONTROLÜ ---
     is_rollover, msg, roll_contract = check_rollover_status()
     if is_rollover:
         st.markdown(f'<div class="rollover-box danger">{msg}</div>', unsafe_allow_html=True)
@@ -397,23 +393,16 @@ if check_login():
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Mevcut Vade', line=dict(color='#1E3A8A', width=3)))
         
-        # EĞRİ NOKTALARI (CURVE POINTS)
-        if curve_data:
-            # Gelecek vadeleri grafikte nokta olarak göster (Fikir vermesi için)
-            future_dates = [datetime.now() + timedelta(days=i*60) for i in range(len(curve_data))] # Temsili tarih
-            fig.add_trace(go.Scatter(
-                x=list(df_hist.index)[-1:], # Sadece son nokta hizasında göster
-                y=[list(curve_data.values())[0]],
-                mode='markers',
-                name=f"Sıradaki Vade ({list(curve_data.keys())[0]})",
-                marker=dict(color='#06B6D4', size=10)
-            ))
-            
+        # Sonraki Vade Çizgisi (Güvenli Kontrol)
+        if 'Pamuk_Next' in df_hist and not df_hist['Pamuk_Next'].isnull().all():
+            contracts = get_forward_curve_tickers()
+            next_name = contracts[1]['ticker'] if len(contracts) > 1 else "Gelecek Vade"
+            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk_Next'], name=f'Sonraki Vade ({next_name})', line=dict(color='#06B6D4', width=2, dash='dash')))
+        
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
         fig.update_layout(height=500, template="plotly_white", margin=dict(l=20,r=20,t=40,b=20), yaxis2=dict(overlaying='y', side='right', showgrid=False), legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         
-        # FORWARD CURVE TABLOSU
         if curve_data:
             st.info(f"⏭️ **Gelecek Vadeler (Forward Curve):** {curve_text}")
 
