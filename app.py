@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from tradingview_ta import TA_Handler, Interval, Exchange
 import time
 import yfinance as yf
+import feedparser
 
 # --- 1. AYARLAR & TASARIM ---
 page_icon = "logo.png" if os.path.exists("logo.png") else "☁️"
@@ -158,7 +159,7 @@ def get_market_history(period_str):
 
 @st.cache_data(ttl=60)
 def get_futures_table_yahoo():
-    """Artık scraping yerine Yahoo Finance kullanarak tablo oluşturuyoruz."""
+    """Yahoo Finance kullanarak tablo oluşturuyoruz."""
     contracts = get_forward_curve_tickers()
     rows = []
     
@@ -256,26 +257,56 @@ def calculate_indicators(df):
     df['SMA20'] = df['Pamuk'].rolling(20).mean(); df['Upper'] = df['SMA20'] + (df['Pamuk'].rolling(20).std() * 2); df['Lower'] = df['SMA20'] - (df['Pamuk'].rolling(20).std() * 2)
     return df
 
+# --- GÜÇLENDİRİLMİŞ HABER MOTORU (v45.1) ---
 @st.cache_data(ttl=900)
 def get_intel_news():
-    queries = ['"cotton futures"', '"USDA" cotton export sales', '"H&M" sales', "polyester fiber price"]
-    whitelist = ['cotton', 'pamuk', 'textile', 'h&m', 'inditex', 'polyester', 'price', 'usda', 'export']
-    news_data = []; translator = GoogleTranslator(source='auto', target='tr'); current_year = datetime.now().year
+    news_data = []
+    translator = GoogleTranslator(source='auto', target='tr')
+    current_year = datetime.now().year
+    
+    # 1. KAYNAK: YAHOO FINANCE (Daha Hızlı ve Güvenilir)
     try:
-        for q in queries:
-            feed = feedparser.parse(f"https://news.google.com/rss/search?q={q.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en")
-            for entry in feed.entries[:3]:
-                if not any(w in entry.title.lower() for w in whitelist): continue
-                try: 
-                    if entry.published_parsed.tm_year < current_year - 1: continue 
-                except: pass
-                blob = TextBlob(entry.title); sent = "🟢" if blob.sentiment.polarity > 0.1 else "🔴" if blob.sentiment.polarity < -0.1 else "⚪"
-                try: tr = translator.translate(entry.title)
-                except: tr = entry.title
-                news_data.append({"Duygu": sent, "Başlık": tr, "Link": entry.link, "Orjinal": entry.title})
-                if len(news_data) >= 10: break
-            if len(news_data) >= 10: break
+        ticker = yf.Ticker("CT=F")
+        yf_news = ticker.news
+        for item in yf_news[:5]: # İlk 5 haber
+            title = item.get('title', '')
+            link = item.get('link', '')
+            if not title: continue
+            
+            # Basit Duygu Analizi
+            blob = TextBlob(title)
+            sent = "🟢" if blob.sentiment.polarity > 0.1 else "🔴" if blob.sentiment.polarity < -0.1 else "⚪"
+            
+            # Çeviri
+            try: tr_title = translator.translate(title)
+            except: tr_title = title
+            
+            news_data.append({"Duygu": sent, "Başlık": tr_title, "Link": link, "Orjinal": title})
     except: pass
+
+    # 2. KAYNAK: GOOGLE RSS (Yedek - Headers ile Korunmuş)
+    if len(news_data) < 5: # Eğer Yahoo'dan az haber geldiyse Google'ı dene
+        queries = ['"cotton futures"', 'polyester price', 'cotton export sales']
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        
+        try:
+            for q in queries:
+                url = f"https://news.google.com/rss/search?q={q.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+                response = requests.get(url, headers=headers, timeout=5)
+                feed = feedparser.parse(response.content)
+                
+                for entry in feed.entries[:3]:
+                    if any(x['Link'] == entry.link for x in news_data): continue # Tekrarı önle
+                    
+                    blob = TextBlob(entry.title)
+                    sent = "🟢" if blob.sentiment.polarity > 0.1 else "🔴" if blob.sentiment.polarity < -0.1 else "⚪"
+                    try: tr_title = translator.translate(entry.title)
+                    except: tr_title = entry.title
+                    
+                    news_data.append({"Duygu": sent, "Başlık": tr_title, "Link": entry.link, "Orjinal": entry.title})
+                    if len(news_data) >= 8: break
+        except: pass
+
     return pd.DataFrame(news_data)
 
 def ask_gemini_with_chart(api_key, spot_val, curve_text, is_rollover, news_df, table_df, poly_cent, cot_summary, scenario, weights):
@@ -367,10 +398,9 @@ if check_login():
     cot_df, cot_source = get_cot_data(uploaded_cot)
     cot_analysis = calculate_cot_trends(cot_df)
     
-    # Canlı Fiyat ve Etiketi
     live_price, live_change, contract_label = get_live_price_data()
     
-    # Derinlik Tablosunu Artık Yahoo'dan Çekiyoruz (Stabil)
+    # Derinlik Tablosunu Yahoo'dan Çekiyoruz
     table_data, table_source = get_futures_table_yahoo()
     
     df_hist = get_market_history(period)
@@ -388,7 +418,6 @@ if check_login():
         cot_summary = f"Tarih: {curr['Date'].strftime('%Y-%m-%d')} | Fon Net: {curr['Net_Fon']} ({cot_analysis['fund_trend']}), Ticari Net: {curr['Net_Ticari']} ({cot_analysis['comm_trend']})"
     else: cot_summary = "COT Verisi Yok"
 
-    # Fiyat Ekranı İçin Değer Ataması
     if live_price > 0: 
         display_price = live_price
         display_change = live_change
