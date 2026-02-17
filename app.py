@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import feedparser
 import google.generativeai as genai
 import requests
 import re
@@ -49,19 +48,16 @@ st.markdown("""
 
 # --- 2. YARDIMCI FONKSİYONLAR ---
 def safe_extract_close(df_or_series):
-    """Veriyi güvenli bir şekilde tekil fiyat serisine dönüştürür."""
     try:
         if df_or_series.empty: return pd.Series()
-        # Eğer MultiIndex sütun varsa (Price, Ticker) -> Sadece Close'u al
         if isinstance(df_or_series, pd.DataFrame):
-            if 'Close' in df_or_series.columns:
-                return df_or_series['Close'].squeeze()
-            else:
-                return df_or_series.iloc[:, 0].squeeze() # İlk sütunu al
+            if 'Close' in df_or_series.columns: return df_or_series['Close'].squeeze()
+            else: return df_or_series.iloc[:, 0].squeeze()
         return df_or_series.squeeze()
     except: return pd.Series()
 
 def get_forward_curve_tickers():
+    """Gelecek 5 kontratı bulur."""
     months = {3: 'H', 5: 'K', 7: 'N', 10: 'V', 12: 'Z'}
     contract_list = []
     now = datetime.now()
@@ -72,11 +68,14 @@ def get_forward_curve_tickers():
     check_year = curr_year
     found_count = 0
     
-    while found_count < 4:
+    while found_count < 5:
         if check_month in months:
+            # Geçmiş ayları dahil etme
             if check_year > curr_year or (check_year == curr_year and check_month >= curr_month):
                 ticker = f"CT{months[check_month]}{check_year}.NYB"
-                label = f"{datetime(2000+check_year, check_month, 1).strftime('%b-%y')}"
+                # İsimlendirme (Örn: Mar '26)
+                month_name_tr = {3:'Mar', 5:'May', 7:'Tem', 10:'Eki', 12:'Ara'}
+                label = f"{month_name_tr[check_month]} '{check_year}"
                 contract_list.append({"ticker": ticker, "label": label})
                 found_count += 1
         check_month += 1
@@ -96,12 +95,21 @@ def check_rollover_status():
 
 # --- 3. VERİ MOTORLARI ---
 @st.cache_data(ttl=10)
-def get_live_price():
+def get_live_price_data():
+    """Hem canlı fiyatı hem de etiketini getirir."""
     try:
+        # TradingView'den anlık veri (Genelde en yakın vadeyi verir)
         cotton = TA_Handler(symbol="CT1!", screener="america", exchange="ICEUS", interval=Interval.INTERVAL_1_MINUTE)
         analysis = cotton.get_analysis()
-        return analysis.indicators["close"], analysis.indicators["close"] - analysis.indicators["open"]
-    except: return 0.0, 0.0
+        price = analysis.indicators["close"]
+        change = analysis.indicators["close"] - analysis.indicators["open"]
+        
+        # Hangi kontrat olduğunu anlamak için ticker listesine bakalım
+        tickers = get_forward_curve_tickers()
+        current_contract_name = tickers[0]['label'] if tickers else "Spot"
+        
+        return price, change, current_contract_name
+    except: return 0.0, 0.0, "Spot"
 
 @st.cache_data(ttl=300)
 def get_forward_curve_data():
@@ -123,14 +131,12 @@ def get_forward_curve_data():
 def get_market_history(period_str):
     mapping = {"3 Ay": "3mo", "6 Ay": "6mo", "1 Yıl": "1y", "3 Yıl": "3y"}
     
-    # 1. Ana Veri
     try:
         main_data = yf.download("CT=F BZ=F DX-Y.NYB CNY=X", period=mapping[period_str], group_by='ticker', progress=False, threads=False)
     except: main_data = pd.DataFrame()
 
-    # 2. Sonraki Vade (Next Contract)
     contracts = get_forward_curve_tickers()
-    next_ticker = contracts[1]['ticker'] if len(contracts) > 1 else "CTK26.NYB" # Listeden 2.yi al (1.si mevcut olabilir)
+    next_ticker = contracts[1]['ticker'] if len(contracts) > 1 else "CTK26.NYB"
     
     try:
         next_data = yf.download(next_ticker, period=mapping[period_str], progress=False, threads=False)
@@ -138,13 +144,11 @@ def get_market_history(period_str):
 
     df = pd.DataFrame()
     if not main_data.empty:
-        # Güvenli Veri Çekme (Squeeze ile)
         df['Pamuk'] = safe_extract_close(main_data['CT=F']) if 'CT=F' in main_data else None
         df['Petrol'] = safe_extract_close(main_data['BZ=F']) if 'BZ=F' in main_data else None
         df['DXY'] = safe_extract_close(main_data['DX-Y.NYB']) if 'DX-Y.NYB' in main_data else None
         df['USDCNY'] = safe_extract_close(main_data['CNY=X']) if 'CNY=X' in main_data else None
         
-        # Sonraki Vadeyi Ekle
         if not next_data.empty:
             df['Pamuk_Next'] = safe_extract_close(next_data)
         else:
@@ -153,25 +157,33 @@ def get_market_history(period_str):
     return df.dropna(subset=['Pamuk'])
 
 @st.cache_data(ttl=60)
-def get_futures_table():
-    url = "https://futures.tradingcharts.com/futures/quotes/ct.html?cbase=ct"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            dfs = pd.read_html(r.text, match="Last")
-            if len(dfs) > 0:
-                raw_df = dfs[0]
-                def clean(val):
-                    txt = re.sub(r'[^\d.-]', '', str(val))
-                    try: return float(txt)
-                    except: return None
-                raw_df['Last_Clean'] = raw_df['Last'].apply(clean)
-                raw_df['Chg_Clean'] = raw_df['Chg'].apply(clean)
-                final_df = raw_df.dropna(subset=['Last_Clean']).rename(columns={'Last_Clean': 'Son', 'Chg_Clean': 'Değişim', 'Month': 'Vade', 'Vol': 'Hacim'})
-                return final_df[['Vade', 'Son', 'Değişim', 'Hacim']].reset_index(drop=True), "Canlı Veri (Vadeli)"
-    except: pass
-    return pd.DataFrame(), "Veri Yok"
+def get_futures_table_yahoo():
+    """Artık scraping yerine Yahoo Finance kullanarak tablo oluşturuyoruz."""
+    contracts = get_forward_curve_tickers()
+    rows = []
+    
+    for c in contracts:
+        try:
+            ticker = yf.Ticker(c['ticker'])
+            hist = ticker.history(period="2d") # Değişim için 2 gün lazım
+            if not hist.empty:
+                last_price = float(hist['Close'].iloc[-1])
+                prev_price = float(hist['Close'].iloc[-2]) if len(hist) > 1 else last_price
+                change = last_price - prev_price
+                volume = int(hist['Volume'].iloc[-1])
+                
+                rows.append({
+                    "Vade": c['label'],
+                    "Son": last_price,
+                    "Değişim": change,
+                    "Hacim": volume
+                })
+        except: continue
+        
+    if rows:
+        return pd.DataFrame(rows), "Canlı Veri (Yahoo)"
+    else:
+        return pd.DataFrame(), "Veri Yok"
 
 @st.cache_data(ttl=600)
 def get_comparison_data(ticker, period_str):
@@ -181,7 +193,7 @@ def get_comparison_data(ticker, period_str):
         return safe_extract_close(data)
     except: return pd.Series()
 
-# --- COT & AI (Standart) ---
+# --- COT ---
 def parse_cftc_file(file_obj):
     try:
         df = pd.read_csv(file_obj, header=None, low_memory=False)
@@ -354,8 +366,13 @@ if check_login():
     # --- VERİ HAZIRLIĞI ---
     cot_df, cot_source = get_cot_data(uploaded_cot)
     cot_analysis = calculate_cot_trends(cot_df)
-    live_price, live_change = get_live_price()
-    table_data, table_source = get_futures_table()
+    
+    # Canlı Fiyat ve Etiketi
+    live_price, live_change, contract_label = get_live_price_data()
+    
+    # Derinlik Tablosunu Artık Yahoo'dan Çekiyoruz (Stabil)
+    table_data, table_source = get_futures_table_yahoo()
+    
     df_hist = get_market_history(period)
     news_df = get_intel_news()
     curve_data, curve_text = get_forward_curve_data()
@@ -371,10 +388,20 @@ if check_login():
         cot_summary = f"Tarih: {curr['Date'].strftime('%Y-%m-%d')} | Fon Net: {curr['Net_Fon']} ({cot_analysis['fund_trend']}), Ticari Net: {curr['Net_Ticari']} ({cot_analysis['comm_trend']})"
     else: cot_summary = "COT Verisi Yok"
 
-    if live_price > 0: display_price = live_price; display_change = live_change
+    # Fiyat Ekranı İçin Değer Ataması
+    if live_price > 0: 
+        display_price = live_price
+        display_change = live_change
+        display_label = f"Pamuk ({contract_label})"
     else:
-        if not table_data.empty: display_price = float(table_data.iloc[0]['Son']); display_change = float(table_data.iloc[0]['Değişim'])
-        else: display_price = df_hist['Pamuk'].iloc[-1]; display_change = 0.0
+        if not table_data.empty: 
+            display_price = float(table_data.iloc[0]['Son'])
+            display_change = float(table_data.iloc[0]['Değişim'])
+            display_label = f"Pamuk ({table_data.iloc[0]['Vade']})"
+        else: 
+            display_price = df_hist['Pamuk'].iloc[-1]
+            display_change = 0.0
+            display_label = "Pamuk (Spot)"
 
     is_rollover, msg, roll_contract = check_rollover_status()
     if is_rollover:
@@ -383,7 +410,7 @@ if check_login():
     # --- EKRANLAR ---
     if menu == "📊 Ana Ekran":
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pamuk (Canlı)", f"{display_price:.2f}c", f"{display_change:.2f}")
+        c1.metric(display_label, f"{display_price:.2f}c", f"{display_change:.2f}")
         c2.metric("Petrol", f"${df_hist['Petrol'].iloc[-1]:.2f}", f"{df_hist['Petrol'].iloc[-1]-df_hist['Petrol'].iloc[-2]:.2f}")
         c3.metric("Sentetik", f"{poly_cent:.2f}c", "Piyasa")
         c4.metric("DXY", f"{df_hist['DXY'].iloc[-1]:.2f}", f"{df_hist['DXY'].iloc[-1]-df_hist['DXY'].iloc[-2]:.2f}")
@@ -393,10 +420,9 @@ if check_login():
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk'], name='Mevcut Vade', line=dict(color='#1E3A8A', width=3)))
         
-        # Sonraki Vade Çizgisi (Güvenli Kontrol)
         if 'Pamuk_Next' in df_hist and not df_hist['Pamuk_Next'].isnull().all():
             contracts = get_forward_curve_tickers()
-            next_name = contracts[1]['ticker'] if len(contracts) > 1 else "Gelecek Vade"
+            next_name = contracts[1]['label'] if len(contracts) > 1 else "Gelecek Vade"
             fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Pamuk_Next'], name=f'Sonraki Vade ({next_name})', line=dict(color='#06B6D4', width=2, dash='dash')))
         
         fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Petrol'], name='Petrol', line=dict(color='#DC2626', width=2, dash='dot'), yaxis='y2'))
